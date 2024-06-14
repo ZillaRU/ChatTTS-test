@@ -72,23 +72,42 @@ for param in chat.pretrain_models['gpt'].head_code.parameters():
 for param in chat.pretrain_models['gpt'].head_text.parameters():
     param.requires_grad = False
 
-class Embedding(torch.nn.Module):
+class EmbeddingText(torch.nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
     def forward(self, input_ids):
         return chat.pretrain_models['gpt'].emb_text(input_ids)
 
-def convert_embedding():
-    model = Embedding()
+def convert_embedding_text():
+    model = EmbeddingText()
     input_ids = torch.tensor([range(SEQ_LENGTH)])
 
     torch.onnx.export(model, (input_ids),
-                      f'{folder}/embedding.onnx',
+                      f'{folder}/embedding_text.onnx',
                       verbose=False,
                       input_names=['input_ids'],
                       output_names=['input_embed'],
                       do_constant_folding=True,
                       opset_version=15)
+
+class EmbeddingCode(torch.nn.Module):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+    def forward(self, input_ids):
+        return chat.pretrain_models['gpt'].emb_code(input_ids)
+
+def convert_embedding_text():
+    model = EmbeddingText()
+    input_ids = torch.tensor([range(SEQ_LENGTH)])
+
+    torch.onnx.export(model, (input_ids),
+                      f'{folder}/embedding_text.onnx',
+                      verbose=False,
+                      input_names=['input_ids'],
+                      output_names=['input_embed'],
+                      do_constant_folding=True,
+                      opset_version=15)
+
 
 class Block(torch.nn.Module):
     def __init__(self, layer_id):
@@ -138,7 +157,7 @@ class BlockCache(torch.nn.Module):
 def convert_block_cache(layer_id):
     model = BlockCache(layer_id)
     hidden_states = torch.randn((1, 1, HIDDEN_SIZE))
-    position_ids = torch.tensor([range(1)], dtype=torch.long)
+    position_ids = torch.tensor([range(1)], dtype=torch.long) ############## shape???
     attention_mask = -1000 * torch.ones((1, 1, 1, SEQ_LENGTH+1), dtype=torch.float32).triu(diagonal=1)
     past_k = torch.randn((1, SEQ_LENGTH, NUM_ATTENTION_HEADS, HEAD_DIM))
     past_v = torch.randn((1, SEQ_LENGTH, NUM_ATTENTION_HEADS, HEAD_DIM))
