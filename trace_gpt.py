@@ -94,14 +94,15 @@ class EmbeddingCode(torch.nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
     def forward(self, input_ids):
-        return chat.pretrain_models['gpt'].emb_code(input_ids)
+        code_emb = [chat.pretrain_models['gpt'].emb_code[i](input_ids[:,:,i]) for i in range(chat.pretrain_models['gpt'].num_vq)]
+        return torch.stack(code_emb, 3).sum(3)
 
-def convert_embedding_text():
-    model = EmbeddingText()
+def convert_embedding_code():
+    model = EmbeddingCode()
     input_ids = torch.tensor([range(SEQ_LENGTH)])
 
     torch.onnx.export(model, (input_ids),
-                      f'{folder}/embedding_text.onnx',
+                      f'{folder}/embedding_code.onnx',
                       verbose=False,
                       input_names=['input_ids'],
                       output_names=['input_embed'],
@@ -174,50 +175,98 @@ def convert_block_cache(layer_id):
         do_constant_folding=True,
         opset_version=15)
 
-# class LmHead_infer_text(torch.nn.Module):
 
-#     def __init__(self):
-#         super().__init__()
+# refs:https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py
+class PenaltySampleHead(torch.nn.Module):
+    def __init__(self, top_k = 50, min_tokens_to_keep = 5):
+        super().__init__()
+        self.top_k = top_k
+        self.min_tokens_to_keep = min_tokens_to_keep
+        self.keep_matrix = torch.zeros((1, self.top_k), dtype=torch.bool)
+        self.keep_matrix[0, :self.min_tokens_to_keep] = True
 
-#     def forward(self, hidden_states):
-#         hidden_states = gpt_model.norm(hidden_states)
-#         m_logits = chat.pretrain_models['gpt'].head_text(hidden_states)
-#         return m_logits
+    def forward(self, m_logits, input_ids, top_p, temperature, penalty):
+        # repeat penalty
+        logits = torch.gather(m_logits, 1, input_ids)
+        logits = torch.where(logits < 0, logits * penalty, logits / penalty)
+        m_logits.scatter_(1, input_ids, logits)
 
+        # top_k
+        logits, token = torch.topk(m_logits.float(), self.top_k)
 
-# class LmHead_infer_code(torch.nn.Module):
+        # temperature
+        logits = logits / temperature
 
-#     def __init__(self):
-#         super().__init__()
-
-#     def forward(self, hidden_states):
-#         hidden_states = gpt_model.norm(hidden_states)
-#         m_logits = torch.stack([chat.pretrain_models['gpt'].head_code[i](hidden_states) for i in range(chat.pretrain_models['gpt'].num_vq)], 3)
-#         return m_logits
-
-# def convert_lm_head_text():
-#     model = LmHead_infer_text()
-#     input = torch.randn(1, HIDDEN_SIZE)
-
-#     torch.onnx.export(model, (input),
-#                       f'{folder}/lm_head_text.onnx',
-#                       verbose=False,
-#                       input_names=['hidden_states'],
-#                       output_names=['m_logits'],
-#                       do_constant_folding=True,
-#                       opset_version=15)
+        # top_p
+        cumulative_probs = logits.softmax(dim=1).cumsum(dim=1)
+        mask = cumulative_probs < top_p
+        mask = mask + self.keep_matrix
+        filtered_logits = torch.where(mask, logits, torch.FloatTensor([-1000.]))
+        probs = filtered_logits.softmax(dim=1)
+        return probs, token
     
-# def convert_lm_head_code():
-#     model = LmHead_infer_code()
-#     input = torch.randn(1, HIDDEN_SIZE)
+def convert_penalty_sample_head():   
+    model = PenaltySampleHead(top_k=20, min_tokens_to_keep=3)
+    m_logits = torch.randn(1, VOCAB_SIZE)
+    input_ids = torch.tensor([range(SEQ_LENGTH)])
+    top_p = torch.tensor([0.7])
+    temperature = torch.tensor([0.7])
+    penalty = torch.tensor([0.98])
 
-#     torch.onnx.export(model, (input),
-#                       f'{folder}/lm_head_code.onnx',
-#                       verbose=False,
-#                       input_names=['hidden_states'],
-#                       output_names=['m_logits'],
-#                       do_constant_folding=True,
-#                       opset_version=15)
+    torch.onnx.export(
+        model, (m_logits, input_ids, top_p, temperature, penalty),
+        f'{folder}/penalty_sample_head.onnx',
+        verbose=False,
+        input_names=[
+            'm_logits', 'input_ids', 'top_p', 'temperature',
+            'penalty'
+        ],
+        output_names=['probs', 'token'],
+        do_constant_folding=True,
+        opset_version=15)
+
+class LmHead_infer_text(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, hidden_states):
+        hidden_states = gpt_model.norm(hidden_states)
+        m_logits = chat.pretrain_models['gpt'].head_text(hidden_states)
+        return m_logits
+
+
+class LmHead_infer_code(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, hidden_states):
+        hidden_states = gpt_model.norm(hidden_states)
+        m_logits = torch.stack([chat.pretrain_models['gpt'].head_code[i](hidden_states) for i in range(chat.pretrain_models['gpt'].num_vq)], 3)
+        return m_logits
+
+def convert_lm_head_text():
+    model = LmHead_infer_text()
+    input = torch.randn(1, HIDDEN_SIZE)
+
+    torch.onnx.export(model, (input),
+                      f'{folder}/lm_head_text.onnx',
+                      verbose=False,
+                      input_names=['hidden_states'],
+                      output_names=['m_logits'],
+                      do_constant_folding=True,
+                      opset_version=15)
+    
+def convert_lm_head_code():
+    model = LmHead_infer_code()
+    input = torch.randn(1, HIDDEN_SIZE)
+
+    torch.onnx.export(model, (input),
+                      f'{folder}/lm_head_code.onnx',
+                      verbose=False,
+                      input_names=['hidden_states'],
+                      output_names=['m_logits'],
+                      do_constant_folding=True,
+                      opset_version=15)
 
 # create folder to store onnx
 if not os.path.exists(folder):
@@ -230,9 +279,13 @@ for i in tqdm(range(NUM_OF_LAYERS)):
     convert_block(i)
 
 print(f'Convert embedding')
-convert_embedding()
+convert_embedding_text()
+convert_embedding_code()
 
-# print(f'Convert lm_head')
-# convert_lm_head_code()
-# convert_lm_head_text()
+print(f'Convert lm_head')
+convert_lm_head_code()
+convert_lm_head_text()
+
+print(f'Convert penalty_sample_head')
+convert_penalty_sample_head()
 print("Done")
