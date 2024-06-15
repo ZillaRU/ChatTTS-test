@@ -66,6 +66,9 @@ folder = f"./tmp/onnx"
 for param in chat.pretrain_models['gpt'].emb_text.parameters():
     param.requires_grad = False
 
+for param in chat.pretrain_models['gpt'].emb_code.parameters():
+    param.requires_grad = False
+
 for param in chat.pretrain_models['gpt'].head_code.parameters():
     param.requires_grad = False
 
@@ -99,7 +102,7 @@ class EmbeddingCode(torch.nn.Module):
 
 def convert_embedding_code():
     model = EmbeddingCode()
-    input_ids = torch.tensor([range(SEQ_LENGTH)])[None].expand(-1, chat.pretrain_models['gpt'].num_vq) # SEQ_LEN, 4
+    input_ids = torch.arange(SEQ_LENGTH).unsqueeze(1).expand(-1, chat.pretrain_models['gpt'].num_vq) # SEQ_LEN, 4
 
     torch.onnx.export(model, (input_ids),
                       f'{folder}/embedding_code.onnx',
@@ -241,7 +244,7 @@ class LmHead_infer_code(torch.nn.Module):
     
     def forward(self, hidden_states):
         hidden_states = gpt_model.norm(hidden_states)
-        m_logits = torch.stack([chat.pretrain_models['gpt'].head_code[i](hidden_states) for i in range(chat.pretrain_models['gpt'].num_vq)], 3)
+        m_logits = torch.stack([chat.pretrain_models['gpt'].head_code[i](hidden_states) for i in range(chat.pretrain_models['gpt'].num_vq)], 2)
         return m_logits
 
 def convert_lm_head_text():
@@ -273,10 +276,10 @@ if not os.path.exists(folder):
     os.makedirs(folder)
 
 # export models
-print(f'Convert block & block_cache')
-for i in tqdm(range(NUM_OF_LAYERS)):
-    convert_block_cache(i)
-    convert_block(i)
+# print(f'Convert block & block_cache')
+# for i in tqdm(range(NUM_OF_LAYERS)):
+#     convert_block_cache(i)
+#     convert_block(i)
 
 print(f'Convert embedding')
 convert_embedding_text()
