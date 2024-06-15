@@ -93,13 +93,13 @@ def convert_embedding_text():
 class EmbeddingCode(torch.nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-    def forward(self, input_ids):
-        code_emb = [chat.pretrain_models['gpt'].emb_code[i](input_ids[:,:,i]) for i in range(chat.pretrain_models['gpt'].num_vq)]
-        return torch.stack(code_emb, 3).sum(3)
+    def forward(self, input_ids): # .expand(-1, -1, models['gpt'].num_vq)
+        code_emb = [chat.pretrain_models['gpt'].emb_code[i](input_ids[:,i]) for i in range(chat.pretrain_models['gpt'].num_vq)]
+        return torch.stack(code_emb, 2).sum(2)
 
 def convert_embedding_code():
     model = EmbeddingCode()
-    input_ids = torch.tensor([range(SEQ_LENGTH)])
+    input_ids = torch.tensor([range(SEQ_LENGTH)])[None].expand(-1, chat.pretrain_models['gpt'].num_vq) # SEQ_LEN, 4
 
     torch.onnx.export(model, (input_ids),
                       f'{folder}/embedding_code.onnx',
