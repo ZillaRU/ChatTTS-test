@@ -98,8 +98,9 @@ class Chat:
             cfg = OmegaConf.load(gpt_config_path)
             gpt = GPT_warpper(**cfg).to(device).eval()
             assert gpt_ckpt_path, 'gpt_ckpt_path should not be None'
-            gpt.load_state_dict(torch.load(gpt_ckpt_path, map_location='cpu'))
+            gpt.load_state_dict(torch.load(gpt_ckpt_path, map_location='cpu'), strict=False)
             if compile and 'cuda' in str(device):
+                breakpoint()
                 gpt.gpt.forward = torch.compile(gpt.gpt.forward,  backend='inductor', dynamic=True)
             self.pretrain_models['gpt'] = gpt
             spk_stat_path = os.path.join(os.path.dirname(gpt_ckpt_path), 'spk_stat.pt')
@@ -117,6 +118,7 @@ class Chat:
         
         if tokenizer_path:
             tokenizer = torch.load(tokenizer_path, map_location='cpu')
+            print(tokenizer)
             tokenizer.padding_side = 'left'
             self.pretrain_models['tokenizer'] = tokenizer
             self.logger.log(logging.INFO, 'tokenizer loaded.')
@@ -155,8 +157,8 @@ class Chat:
                 text[i] = apply_character_map(t)
                 
         if not skip_refine_text:
-            text_tokens = refine_text(self.pretrain_models, text, **params_refine_text)['ids']
-            text_tokens = [i[i < self.pretrain_models['tokenizer'].convert_tokens_to_ids('[break_0]')] for i in text_tokens]
+            text_tokens = refine_text(self.pretrain_models, text, **params_refine_text) # ['ids']
+            text_tokens = [i[i < self.pretrain_models['tokenizer'].convert_tokens_to_ids('[break_0]')] for i in text_tokens] #21147
             text = self.pretrain_models['tokenizer'].batch_decode(text_tokens)
             if refine_text_only:
                 return text
@@ -165,14 +167,16 @@ class Chat:
         params_infer_code.pop('prompt', '')
         result = infer_code(self.pretrain_models, text, **params_infer_code, return_hidden=use_decoder)
         
-        if use_decoder:
+        if use_decoder: # true
+            print('decoder input', [i[None].permute(0,2,1).shape for i in result['hiddens']])
             mel_spec = [self.pretrain_models['decoder'](i[None].permute(0,2,1)) for i in result['hiddens']]
         else:
+            print('dvae input', [i[None].permute(0,2,1).shape for i in result['ids']])
             mel_spec = [self.pretrain_models['dvae'](i[None].permute(0,2,1)) for i in result['ids']]
-            
-        wav = [self.pretrain_models['vocos'].decode(i).cpu().numpy() for i in mel_spec]
-        
-        return wav
+        print('decoder out permute / vocos input', [i.shape for i in mel_spec])
+        wav = [self.pretrain_models['vocos'].decode(i).cpu().numpy() for i in mel_spec] # vocos 去除了转置卷积，直接由傅立叶逆变换，完成上采样 速度相比hifigan提升一个数量级，且效果更好
+        breakpoint()
+        return wav  # [1,250624] #/256
     
     def sample_random_speaker(self, ):
         
