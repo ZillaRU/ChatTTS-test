@@ -36,9 +36,9 @@ public:
   int forward_next_text();
   std::vector<int> generate_text(std::vector<int> &history_tokens, int EOS, float tempreature);
 
-  py::dict forward_first_code(std::vector<int> &tokens);
+  py::dict forward_first_code(std::vector<int> &tokens, int idx_spk, std::vector<uint16_t> spk_emb);
   py::dict forward_next_code();
-  py::dict generate_code(std::vector<int> &history_tokens, int EOS, float tempreture);
+  py::dict generate_code(std::vector<int> &history_tokens, int spk_idx, std::vector<uint16_t> &spk_emb, int EOS, float tempreture);
 
   std::mt19937 sgen;
   TTSLlama() : sgen(std::random_device()()){};
@@ -47,11 +47,9 @@ private:
   void net_launch(const bm_net_info_t *net, int stage_idx = 0);
   inline void d2d(bm_device_mem_t &dst, bm_device_mem_t &src);
 
-  void head_text_launch(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
-  void head_code_launch(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
+  void head_launch(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
   int greedy_search(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
-  int penalty_sample_text(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
-  int penalty_sample_code(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
+  int penalty_sample(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
 
 public:
   int token_length;
@@ -62,14 +60,11 @@ public:
   std::vector<int> visited_tokens;
 
   // generation
-  float temperature_text;
-  float temperature_code;
+  float temperature;
   float top_p;
   float repeat_penalty;
   int repeat_last_n;
   int max_new_tokens;
-  std::string generation_mode;
-  std::string prompt_mode;
 
 private:
   std::vector<bm_handle_t> handles;
@@ -78,7 +73,7 @@ private:
   std::vector<const bm_net_info_t *> net_blocks;
   std::vector<const bm_net_info_t *> net_blocks_cache;
   const bm_net_info_t *net_embed_text, *net_embed_code;
-  const bm_net_info_t *net_embed_cache, *net_embed_code_cache;
+  const bm_net_info_t *net_embed_text_cache, *net_embed_code_cache;
   const bm_net_info_t *net_lm_text, *net_lm_code, *net_penalty_sample_head;
   std::vector<bm_device_mem_t> past_key;
   std::vector<bm_device_mem_t> past_value;
@@ -151,10 +146,12 @@ void TTSLlama::init(const std::vector<int> &devices, std::string model_path) {
   net_penalty_sample_head = bmrt_get_network_info(p_bmrt, "penalty_sample_head");
 
   SEQLEN = net_embed_text->stages[0].input_shapes[0].dims[1]; // real seqlen
+  printf("SEQLEN: %d\n", SEQLEN);
   auto num_nets = bmrt_get_network_number(p_bmrt);
 
   NUM_LAYERS = (num_nets - 7) / 2;
-  hidden_size = net_embed_text->stages[0].output_shapes[0].dims[1];
+  hidden_size = net_embed_text->stages[0].output_shapes[0].dims[2];
+  printf("NUM_LAYERS: %d, hidden_size: %d\n", NUM_LAYERS, hidden_size);
   assert(hidden_size == 768);
 
   // resize
@@ -337,8 +334,8 @@ int TTSLlama::forward_next_text() {
   int32_t position_id = token_length - 1;
 
   // embedding
-  auto &in_mem = net_embed_cache->stages[0].input_mems[0];
-  auto &out_mem = net_embed_cache->stages[0].output_mems[0];
+  auto &in_mem = net_embed_text_cache->stages[0].input_mems[0];
+  auto &out_mem = net_embed_text_cache->stages[0].output_mems[0];
   bm_memcpy_s2d(bm_handle, in_mem, (void *)&cur_token);
   net_launch(net_embed_text_cache);
 
@@ -394,7 +391,7 @@ int TTSLlama::forward_next_text() {
   return token;
 }
 
-std::vector<int> TTSLlama::generate_text(std::vector<int> &history_tokens, int EOS, float tempreature) {
+std::vector<int> TTSLlama::generate_text(std::vector<int> &history_tokens, int EOS, float temp_tempreature) {
   if (history_tokens.empty()) {
     printf("Sorry: your text is empty!!\n");
     history_tokens.clear();
@@ -404,11 +401,11 @@ std::vector<int> TTSLlama::generate_text(std::vector<int> &history_tokens, int E
   // make sure token not too large
   if ((int)history_tokens.size() > SEQLEN - 10) {
     history_tokens.clear();
-    printf("Error: your text is too large!\n");
+    printf("Error: your original text is too large!\n");
     return {};
   }
   std::fill(visited_tokens.begin(), visited_tokens.end(), 0);
-  temperature_text = tempreature;
+  temperature = temp_tempreature;
 
   std::vector<int> result_tokens;
   int token = forward_first_text(history_tokens);
@@ -419,7 +416,7 @@ std::vector<int> TTSLlama::generate_text(std::vector<int> &history_tokens, int E
   return result_tokens;
 }
 
-py:dict TTSLlama::forward_first_code(std::vector<int> &tokens) {
+py::dict TTSLlama::forward_first_code(std::vector<int> &tokens, int idx_spk, std::vector<uint16_t> spk_emb) {
   std::vector<int> position_id(SEQLEN, 0);
   std::vector<uint16_t> attention_mask(SEQLEN * SEQLEN, ATTENTION_MASK);
   std::copy(tokens.begin(), tokens.end(), visited_tokens.data());
@@ -443,6 +440,20 @@ py:dict TTSLlama::forward_first_code(std::vector<int> &tokens) {
   bm_memcpy_s2d(bm_handle, in_mem, (void *)visited_tokens.data());
   net_launch(net_embed_code); // prefil embedding
 
+  // the embedding of empty_spk --> spk_emb
+  if (idx_spk != -1) {
+    int byte_size = 2;
+    // switch(out_mem->dtype) {
+    //     case bmruntime::BM_FLOAT16:
+    //         byte_size = 2;
+    //         break;
+    //     default:
+    //         std::cout << "Data type is unknown" << std::endl;
+    //         exit(-1);
+    // }
+    bm_memcpy_s2d_partial_offset(bm_handle, out_mem, (void *)spk_emb.data(), hidden_size*byte_size, idx_spk*hidden_size*byte_size); // bytesize, offset
+  }
+
   // forward blocks
   for (int idx = 0; idx < NUM_LAYERS; idx++) {
     auto &in0_mem = net_blocks[idx]->stages[0].input_mems[0];
@@ -461,7 +472,7 @@ py:dict TTSLlama::forward_first_code(std::vector<int> &tokens) {
   }
 
   std::vector<uint16_t> last_hidden(hidden_size, 0);
-  bm_memcpy_d2s(bm_handle, last_hidden.data(), net_blocks[NUM_LAYERS-1]->stages[0].output_mems[0]);
+  bm_memcpy_d2s(bm_handle, (void *)last_hidden.data(), net_blocks[NUM_LAYERS-1]->stages[0].output_mems[0]);
 
   // forward lmhead
   int bytes = out_mem.size / SEQLEN;
@@ -476,13 +487,13 @@ py:dict TTSLlama::forward_first_code(std::vector<int> &tokens) {
 
   visited_tokens[token_length] = token;
   token_length += 1;
-  py:dict result;
+  py::dict result;
   result["token"] = token;
   result["last_hidden"] = last_hidden;
   return result;
 }
 
-py:dict TTSLlama::forward_next_code() {
+py::dict TTSLlama::forward_next_code() {
   int cur_token = visited_tokens[token_length - 1];
 
   std::vector<uint16_t> attention_mask(SEQLEN + 1, 0);
@@ -536,7 +547,7 @@ py:dict TTSLlama::forward_next_code() {
   }
 
   std::vector<uint16_t> last_hidden(hidden_size, 0);
-  bm_memcpy_d2s(bm_handle, last_hidden.data(), out0_mem);
+  bm_memcpy_d2s(bm_handle, (void *)last_hidden.data(), out_mem);
   
   // forward lmhead
   auto &lm_in_mem = net_lm_text->stages[0].input_mems[0];
@@ -549,38 +560,38 @@ py:dict TTSLlama::forward_next_code() {
   
   visited_tokens[token_length] = token;
   token_length += 1;
-  py:dict result;
+  py::dict result;
   result["token"] = token;
   result["last_hidden"] = last_hidden;
   return result;
 }
 
-py::dict TTSLlama::generate_code(std::vector<int> &history_tokens, int EOS, float tempreature) {
+py::dict TTSLlama::generate_code(std::vector<int> &history_tokens, int idx_spk, std::vector<uint16_t> &spk_emb, int EOS, float temp_tempreature) {
+  py::dict result;
   if (history_tokens.empty()) {
     printf("Sorry: your text is empty!!\n");
     history_tokens.clear();
-    return {};
+    return result;
   }
 
   // make sure token not too largace
   if ((int)history_tokens.size() > SEQLEN - 10) {
     history_tokens.clear();
     printf("Error: your text is too large!\n");
-    return {};
+    return result;
   }
 
-  temperature_code = tempreature;
+  temperature = temp_tempreature;
   std::vector<int> result_tokens;
-  std::vector<vector<uint16_t> > result_hiddens;
-  py::dict curr_res = forward_first_code(history_tokens);
+  std::vector<std::vector<uint16_t> > result_hiddens;
+  py::dict curr_res = forward_first_code(history_tokens, idx_spk, spk_emb);
   int token = curr_res["token"].cast<int>();
   while (token != EOS && token_length < SEQLEN) {
     result_tokens.emplace_back(token);
-    result_hiddens.emplace_back(curr_res["hiddens"]);
+    result_hiddens.emplace_back(curr_res["hiddens"].cast<std::vector<uint16_t>>());
     curr_res = forward_next_code();
     token = curr_res["token"].cast<int>();
   }
-  py:dict result;
   result["tokens"] = result_tokens;
   result["hiddens"] = result_hiddens;
   return result;
@@ -603,7 +614,5 @@ PYBIND11_MODULE(llama, m) {
         .def_readwrite("top_p", &TTSLlama::top_p)
         .def_readwrite("repeat_penalty", &TTSLlama::repeat_penalty)
         .def_readwrite("repeat_last_n", &TTSLlama::repeat_last_n)
-        .def_readwrite("max_new_tokens", &TTSLlama::max_new_tokens)
-        .def_readwrite("generation_mode", &TTSLlama::generation_mode)
-        .def_readwrite("prompt_mode", &TTSLlama::prompt_mode);
+        .def_readwrite("max_new_tokens", &TTSLlama::max_new_tokens);
 }

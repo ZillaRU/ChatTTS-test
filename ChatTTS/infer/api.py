@@ -16,7 +16,7 @@ def infer_code(
     **kwargs
 ):
     
-    device = next(models['gpt'].parameters()).device
+    device = next(models['vocos'].parameters()).device
     
     if not isinstance(text, list): 
         text = [text]
@@ -32,7 +32,7 @@ def infer_code(
     text_token = models['tokenizer'](text, return_tensors='pt', add_special_tokens=False, padding=True).to(device) 
 
     print(text_token)
-    input_ids = text_token['input_ids'][...,None].expand(-1, -1, models['gpt'].num_vq) # torch.Size([1, 66, 4])
+    input_ids = text_token['input_ids'] # [...,None].expand(-1, -1, models['gpt'].num_vq) # torch.Size([1, 66, 4])
     
     inputs = {
         'input_ids': input_ids,
@@ -81,7 +81,7 @@ def refine_text(
     **kwargs
 ):
     
-    device = next(models['gpt'].parameters()).device
+    device = next(models['vocos'].parameters()).device
     
     if not isinstance(text, list): 
         text = [text]
@@ -93,7 +93,7 @@ def refine_text(
     text_mask = torch.ones(text_token['input_ids'].shape, dtype=bool, device=device)
 
     inputs = {
-        'input_ids': text_token['input_ids'][...,None].expand(-1, -1, models['gpt'].num_vq),
+        'input_ids': text_token['input_ids'], # [...,None].expand(-1, -1, models['gpt'].num_vq),
         'text_mask': text_mask,
         'attention_mask': text_token['attention_mask'],
     }
