@@ -24,9 +24,9 @@ class GPT_warpper(nn.Module):
         **kwargs,
         ):
         super().__init__()
-
+        import llama
         self.logger = logging.getLogger(__name__)
-        self.gpt = self.build_model(gpt_config) ##### TODO: import llama cpp module
+        self.gpt = llama.TTSLlama()
         self.model_dim = self.gpt.config.hidden_size 
 
         self.num_vq = num_vq
@@ -180,6 +180,7 @@ class GPT_warpper(nn.Module):
         LogitsProcessors = [],
         return_hidden=False,
     ):
+        self.gpt.generate_text(inputs_ids, max_new_token)
         
         with torch.no_grad():
 

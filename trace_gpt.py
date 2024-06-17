@@ -52,6 +52,7 @@ LlamaConfig {
 
 config = gpt_model.config
 layers = gpt_model.layers
+model_norm = gpt_model.norm
 
 NUM_OF_LAYERS = config.num_hidden_layers
 HIDDEN_SIZE = config.hidden_size
@@ -97,12 +98,13 @@ class EmbeddingCode(torch.nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
     def forward(self, input_ids): # .expand(-1, -1, models['gpt'].num_vq)
+        input_ids = input_ids.unsqueeze(1).expand(-1, chat.pretrain_models['gpt'].num_vq)
         code_emb = [chat.pretrain_models['gpt'].emb_code[i](input_ids[:,i]) for i in range(chat.pretrain_models['gpt'].num_vq)]
         return torch.stack(code_emb, 2).sum(2)
 
 def convert_embedding_code():
     model = EmbeddingCode()
-    input_ids = torch.arange(SEQ_LENGTH).unsqueeze(1).expand(-1, chat.pretrain_models['gpt'].num_vq) # SEQ_LEN, 4
+    input_ids = torch.tensor([range(SEQ_LENGTH)])
 
     torch.onnx.export(model, (input_ids),
                       f'{folder}/embedding_code.onnx',
@@ -118,12 +120,15 @@ class Block(torch.nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.layer = layers[layer_id] # LlamaDecoderLayer
+        self.norm = model_norm
     def forward(self, hidden_states, position_ids, attention_mask):
         hidden_states, past_kv = self.layer(hidden_states=hidden_states,
                                             attention_mask=attention_mask,
                                             position_ids=position_ids,
                                             use_cache=True)
         present_k, present_v = past_kv
+        if(self.layer_id == NUM_OF_LAYERS - 1):
+            hidden_states = self.norm(hidden_states)
         return hidden_states, present_k, present_v
 
 def convert_block(layer_id):
@@ -147,6 +152,7 @@ class BlockCache(torch.nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.layer = layers[layer_id]
+        self.norm = model_norm
 
     def forward(self, hidden_states, position_ids, attention_mask, past_k,
                 past_v):
@@ -156,6 +162,8 @@ class BlockCache(torch.nn.Module):
                                             past_key_value=(past_k, past_v),
                                             use_cache=True)
         present_k, present_v = past_kv
+        if(self.layer_id == NUM_OF_LAYERS - 1):
+            hidden_states = self.norm(hidden_states)
         return hidden_states, present_k, present_v
 
 def convert_block_cache(layer_id):
@@ -233,7 +241,7 @@ class LmHead_infer_text(torch.nn.Module):
         super().__init__()
 
     def forward(self, hidden_states):
-        hidden_states = gpt_model.norm(hidden_states)
+        # hidden_states = gpt_model.norm(hidden_states)
         m_logits = chat.pretrain_models['gpt'].head_text(hidden_states)
         return m_logits
 
@@ -243,7 +251,7 @@ class LmHead_infer_code(torch.nn.Module):
         super().__init__()
     
     def forward(self, hidden_states):
-        hidden_states = gpt_model.norm(hidden_states)
+        # hidden_states = gpt_model.norm(hidden_states)
         m_logits = torch.stack([chat.pretrain_models['gpt'].head_code[i](hidden_states) for i in range(chat.pretrain_models['gpt'].num_vq)], 2)
         return m_logits
 
