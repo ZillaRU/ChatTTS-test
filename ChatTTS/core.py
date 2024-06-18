@@ -7,7 +7,8 @@ from omegaconf import OmegaConf
 import torch
 from vocos import Vocos
 from .model.dvae import DVAE
-from .model.gpt import GPT_warpper
+from .model.gpt_tpu import GPT_warpper
+# from .model.gpt import GPT_warpper # for tracing onnx
 from .utils.gpu_utils import select_device
 from .utils.infer_utils import count_invalid_characters, detect_language, apply_character_map, apply_half2full_map
 from .utils.io_utils import get_latest_modified_file
@@ -160,6 +161,7 @@ class Chat:
             text_tokens = refine_text(self.pretrain_models, text, **params_refine_text) # ['ids']
             text_tokens = [i[i < self.pretrain_models['tokenizer'].convert_tokens_to_ids('[break_0]')] for i in text_tokens] #21147
             text = self.pretrain_models['tokenizer'].batch_decode(text_tokens)
+            print('refine text', text)
             if refine_text_only:
                 return text
             
