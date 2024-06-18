@@ -106,6 +106,7 @@ class GPT_warpper(nn.Module):
         LogitsProcessors = [],
         return_hidden=False,
     ):
+        breakpoint()
         inputs_ids_list = inputs_ids[0].tolist()
         inputs_ids = self.gpt.generate_text(inputs_ids_list, int(eos_token.item()), float(temperature.item()))
         return inputs_ids

@@ -5,6 +5,9 @@ if (NOT DEFINED TARGET_ARCH)
     set(TARGET_ARCH pcie)
 endif()
 
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 message("TARGET_ARCH: ${TARGET_ARCH}")
 message("PROJECT_SOURCE_DIR: ${PROJECT_SOURCE_DIR}")
 include_directories(${PROJECT_SOURCE_DIR}/../../LLM-TPU/support/include)

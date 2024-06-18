@@ -59,7 +59,8 @@ HIDDEN_SIZE = config.hidden_size
 NUM_ATTENTION_HEADS = config.num_attention_heads
 NUM_KEY_VALUE_HEADS = config.num_key_value_heads
 HEAD_DIM = HIDDEN_SIZE // NUM_ATTENTION_HEADS # 64
-VOCAB_SIZE = config.vocab_size
+TEXT_VOCAB_SIZE = 21178
+AUDIO_VOCAB_SIZE = 626 # config.vocab_size
 SEQ_LENGTH = 512
 folder = f"./tmp/onnx"
 
@@ -216,9 +217,9 @@ class PenaltySampleHead(torch.nn.Module):
         probs = filtered_logits.softmax(dim=1)
         return probs, token
     
-def convert_penalty_sample_head():   
+def convert_penalty_sample_head(TYPE, VOCAB_SIZE):   
     model = PenaltySampleHead(top_k=20, min_tokens_to_keep=3)
-    m_logits = torch.randn(1, VOCAB_SIZE)
+    m_logits = torch.randn(1, VOCAB_SIZE) ### for text generation: VOCAB_SIZE
     input_ids = torch.tensor([range(SEQ_LENGTH)])
     top_p = torch.tensor([0.7])
     temperature = torch.tensor([0.7])
@@ -226,7 +227,7 @@ def convert_penalty_sample_head():
 
     torch.onnx.export(
         model, (m_logits, input_ids, top_p, temperature, penalty),
-        f'{folder}/penalty_sample_head.onnx',
+        f'{folder}/penalty_sample_head_{TYPE}.onnx',
         verbose=False,
         input_names=[
             'm_logits', 'input_ids', 'top_p', 'temperature',
@@ -298,5 +299,6 @@ convert_lm_head_code()
 convert_lm_head_text()
 
 print(f'Convert penalty_sample_head')
-convert_penalty_sample_head()
+convert_penalty_sample_head('text', TEXT_VOCAB_SIZE)
+convert_penalty_sample_head('code', AUDIO_VOCAB_SIZE)
 print("Done")

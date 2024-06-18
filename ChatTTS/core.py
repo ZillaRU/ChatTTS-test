@@ -86,13 +86,13 @@ class Chat:
             self.pretrain_models['vocos'] = vocos
             self.logger.log(logging.INFO, 'vocos loaded.')
         
-        if dvae_config_path:
-            cfg = OmegaConf.load(dvae_config_path)
-            dvae = DVAE(**cfg).to(device).eval()
-            assert dvae_ckpt_path, 'dvae_ckpt_path should not be None'
-            dvae.load_state_dict(torch.load(dvae_ckpt_path, map_location='cpu'))
-            self.pretrain_models['dvae'] = dvae
-            self.logger.log(logging.INFO, 'dvae loaded.')
+        # if dvae_config_path:
+        #     cfg = OmegaConf.load(dvae_config_path)
+        #     dvae = DVAE(**cfg).to(device).eval()
+        #     assert dvae_ckpt_path, 'dvae_ckpt_path should not be None'
+        #     dvae.load_state_dict(torch.load(dvae_ckpt_path, map_location='cpu'))
+        #     self.pretrain_models['dvae'] = dvae
+        #     self.logger.log(logging.INFO, 'dvae loaded.')
             
         if gpt_config_path:
             cfg = OmegaConf.load(gpt_config_path)
