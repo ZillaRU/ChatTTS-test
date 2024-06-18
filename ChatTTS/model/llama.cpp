@@ -612,8 +612,8 @@ py::dict TTSLlama::forward_next_code()
   bm_memcpy_d2s(bm_handle, (void *)last_hidden.data(), out_mem);
 
   // forward lmhead
-  auto &lm_in_mem = net_lm_text->stages[0].input_mems[0];
-  auto &lm_out_mem = net_lm_text->stages[0].output_mems[0];
+  auto &lm_in_mem = net_lm_code->stages[0].input_mems[0];
+  auto &lm_out_mem = net_lm_code->stages[0].output_mems[0];
   d2d(lm_in_mem, out_mem);
   net_launch(net_lm_text);
 
