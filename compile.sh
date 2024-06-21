@@ -135,8 +135,7 @@ model_deploy.py \
 
 model_transform.py \
     --model_name embedding_code_cache \
-    --model_def ../onnx/embedding_code.onnx \
-    --input_shapes [[1,4]] \
+    --model_def ../onnx/embedding_code_cache.onnx \
     --mlir embedding_code_cache.mlir
 
 model_deploy.py \

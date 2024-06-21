@@ -7,9 +7,8 @@ import torch.jit as jit
 import torch.onnx as onnx
 import ChatTTS
 
-
 chat = ChatTTS.Chat()
-chat.load_models()
+chat.load_models('local', local_path='./model_files')
 
 
 gpt_model = chat.pretrain_models['gpt'].gpt.eval()
@@ -98,9 +97,9 @@ def convert_embedding_text():
 class EmbeddingCode(torch.nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-    def forward(self, input_ids): # .expand(-1, -1, models['gpt'].num_vq)
-        input_ids = input_ids.unsqueeze(1).expand(-1, chat.pretrain_models['gpt'].num_vq)
-        code_emb = [chat.pretrain_models['gpt'].emb_code[i](input_ids[:,i]) for i in range(chat.pretrain_models['gpt'].num_vq)]
+    def forward(self, input_ids):
+        input_ids = input_ids.unsqueeze(2).expand(-1, -1, chat.pretrain_models['gpt'].num_vq) # for forward_first_code
+        code_emb = [chat.pretrain_models['gpt'].emb_code[i](input_ids[:,:,i]) for i in range(chat.pretrain_models['gpt'].num_vq)]
         return torch.stack(code_emb, 2).sum(2)
 
 def convert_embedding_code():
@@ -115,6 +114,25 @@ def convert_embedding_code():
                       do_constant_folding=True,
                       opset_version=15)
 
+class EmbeddingCodeCache(torch.nn.Module):  # for forward_next_code
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+    def forward(self, input_ids):
+        code_emb = [chat.pretrain_models['gpt'].emb_code[i](input_ids[:,:,i]) for i in range(chat.pretrain_models['gpt'].num_vq)]
+        return torch.stack(code_emb, 2).sum(2)
+
+def convert_embedding_code_cache():
+    model = EmbeddingCodeCache()
+    input_ids = torch.tensor([[range(chat.pretrain_models['gpt'].num_vq)]])
+    print(input_ids.shape)
+
+    torch.onnx.export(model, (input_ids),
+                      f'{folder}/embedding_code_cache.onnx',
+                      verbose=False,
+                      input_names=['input_ids'],
+                      output_names=['input_embed'],
+                      do_constant_folding=True,
+                      opset_version=15)
 
 class Block(torch.nn.Module):
     def __init__(self, layer_id):
@@ -187,9 +205,43 @@ def convert_block_cache(layer_id):
         do_constant_folding=True,
         opset_version=15)
 
+class GreedyHead(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, m_logits):
+        _, token = torch.topk(m_logits.float(), 1)
+        return token
+
+def convert_greedy_head_text():   
+    model = GreedyHead()
+    m_logits = torch.randn(1, TEXT_VOCAB_SIZE)
+
+    torch.onnx.export(
+        model, (m_logits),
+        f'{folder}/greedy_head_text.onnx',
+        verbose=False,
+        input_names=['m_logits'],
+        output_names=['token'],
+        do_constant_folding=True,
+        opset_version=15)
+    
+def convert_greedy_head_code():   
+    model = GreedyHead()
+    m_logits = torch.randn(1, AUDIO_VOCAB_SIZE, chat.pretrain_models['gpt'].num_vq)
+
+    torch.onnx.export(
+        model, (m_logits),
+        f'{folder}/greedy_head_code.onnx',
+        verbose=False,
+        input_names=['m_logits'],
+        output_names=['token'],
+        do_constant_folding=True,
+        opset_version=15)
 
 # refs:https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py
-class PenaltySampleHead(torch.nn.Module):
+class PenaltySampleHeadText(torch.nn.Module):
     def __init__(self, top_k = 50, min_tokens_to_keep = 5):
         super().__init__()
         self.top_k = top_k
@@ -204,7 +256,7 @@ class PenaltySampleHead(torch.nn.Module):
         m_logits.scatter_(1, input_ids, logits)
 
         # top_k
-        logits, token = torch.topk(m_logits.float(), self.top_k)
+        logits, token = torch.topk(m_logits.float(), self.top_k, dim=1)
 
         # temperature
         logits = logits / temperature
@@ -217,8 +269,8 @@ class PenaltySampleHead(torch.nn.Module):
         probs = filtered_logits.softmax(dim=1)
         return probs, token
     
-def convert_penalty_sample_head(TYPE, VOCAB_SIZE):   
-    model = PenaltySampleHead(top_k=20, min_tokens_to_keep=3)
+def convert_penalty_sample_head_text(VOCAB_SIZE):   
+    model = PenaltySampleHeadText(top_k=20, min_tokens_to_keep=3)
     m_logits = torch.randn(1, VOCAB_SIZE) ### for text generation: VOCAB_SIZE
     input_ids = torch.tensor([range(SEQ_LENGTH)])
     top_p = torch.tensor([0.7])
@@ -227,7 +279,55 @@ def convert_penalty_sample_head(TYPE, VOCAB_SIZE):
 
     torch.onnx.export(
         model, (m_logits, input_ids, top_p, temperature, penalty),
-        f'{folder}/penalty_sample_head_{TYPE}.onnx',
+        f'{folder}/penalty_sample_head_text.onnx',
+        verbose=False,
+        input_names=[
+            'm_logits', 'input_ids', 'top_p', 'temperature',
+            'penalty'
+        ],
+        output_names=['probs', 'token'],
+        do_constant_folding=True,
+        opset_version=15)
+    
+class PenaltySampleHeadCode(torch.nn.Module):
+    def __init__(self, top_k = 50, min_tokens_to_keep = 5):
+        super().__init__()
+        self.top_k = top_k
+        self.min_tokens_to_keep = min_tokens_to_keep
+        self.keep_matrix = torch.zeros((1, self.top_k, chat.pretrain_models['gpt'].num_vq), dtype=torch.bool)
+        self.keep_matrix[0, :self.min_tokens_to_keep, :] = True
+
+    def forward(self, m_logits, input_ids, top_p, temperature, penalty):
+        # m_logits: [1, VOCAB_SIZE, NUM_VQ]
+        logits = torch.gather(m_logits, 1, input_ids)
+        logits = torch.where(logits < 0, logits * penalty, logits / penalty)
+        m_logits.scatter_(1, input_ids, logits)
+
+        # top_k
+        logits, token = torch.topk(m_logits.float(), self.top_k, dim=1)
+
+        # temperature
+        logits = logits / temperature
+
+        # top_p
+        cumulative_probs = logits.softmax(dim=1).cumsum(dim=1)
+        mask = cumulative_probs < top_p
+        mask = mask + self.keep_matrix
+        filtered_logits = torch.where(mask, logits, torch.FloatTensor([-1000.]))
+        probs = filtered_logits.softmax(dim=1)
+        return torch.transpose(probs, -2, -1), torch.transpose(token, -2, -1) ## [xxx, 4] --> [4, xxx]
+
+def convert_penalty_sample_head_code(VOCAB_SIZE):   
+    model = PenaltySampleHeadCode(top_k=20, min_tokens_to_keep=3)
+    m_logits = torch.randn(1, VOCAB_SIZE, chat.pretrain_models['gpt'].num_vq)
+    input_ids = torch.tensor([range(SEQ_LENGTH)]).unsqueeze(-1).expand(-1, -1, chat.pretrain_models['gpt'].num_vq)
+    top_p = torch.tensor([0.7])
+    temperature = torch.tensor([0.7])
+    penalty = torch.tensor([0.98])
+
+    torch.onnx.export(
+        model, (m_logits, input_ids, top_p, temperature, penalty),
+        f'{folder}/penalty_sample_head_code.onnx',
         verbose=False,
         input_names=[
             'm_logits', 'input_ids', 'top_p', 'temperature',
@@ -284,21 +384,27 @@ def convert_lm_head_code():
 if not os.path.exists(folder):
     os.makedirs(folder)
 
+
 # export models
-# print(f'Convert block & block_cache')
-# for i in tqdm(range(NUM_OF_LAYERS)):
-#     convert_block_cache(i)
-#     convert_block(i)
+print(f'Convert block & block_cache')
+for i in tqdm(range(NUM_OF_LAYERS)):
+    convert_block_cache(i)
+    convert_block(i)
 
 print(f'Convert embedding')
 convert_embedding_text()
 convert_embedding_code()
+convert_embedding_code_cache()
 
 print(f'Convert lm_head')
 convert_lm_head_code()
 convert_lm_head_text()
 
+print(f'Convert greedy_head')
+convert_greedy_head_text()
+convert_greedy_head_code()
+
 print(f'Convert penalty_sample_head')
-convert_penalty_sample_head('text', TEXT_VOCAB_SIZE)
-convert_penalty_sample_head('code', AUDIO_VOCAB_SIZE)
+convert_penalty_sample_head_text(TEXT_VOCAB_SIZE)
+convert_penalty_sample_head_code(AUDIO_VOCAB_SIZE)
 print("Done")

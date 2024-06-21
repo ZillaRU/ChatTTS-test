@@ -113,19 +113,20 @@ class GPT_warpper(nn.Module):
                     if spk_emb is not None:
                         emb[inputs_ids[:, -1] == 21143] = spk_emb.to(emb.device)
                     model_input['inputs_embeds'] = emb
+                    breakpoint()
                 else:
                     code_emb = [self.emb_code[i](model_input['input_ids'][:,:,i]) for i in range(self.num_vq)]
                     model_input['inputs_embeds'] = torch.stack(code_emb, 3).sum(3)
                 
                 model_input['input_ids'] = None
-
+                print("emb", model_input['inputs_embeds'].shape)
                 outputs = self.gpt.forward(**model_input, output_attentions=False)
-                
+                print("code hidden", outputs[0].shape)
                 hidden_states = outputs[0] # 🐻 [1, 57, 768]
                 hiddens.append(hidden_states[:, -1])
 
-                logits = torch.stack([self.head_code[i](hidden_states) for i in range(self.num_vq)], 3)
-        
+                logits = torch.stack([self.head_code[i](hidden_states) for i in range(self.num_vq)], 3) #torch.Size([1, 18, 626, 4])
+                breakpoint()
                 logits = logits[:, -1].float()
 
                 logits = rearrange(logits, "b c n -> (b n) c")
@@ -144,7 +145,7 @@ class GPT_warpper(nn.Module):
                 
                 scores = F.softmax(logits, dim=-1)
             
-                idx_next = torch.multinomial(scores, num_samples=1)
+                idx_next = torch.multinomial(scores, num_samples=1) # 每一行代表一个分布
                 
                 idx_next = rearrange(idx_next, "(b n) 1 -> b n", n=self.num_vq)
                 finish = finish | (idx_next == eos_token).any(1)
@@ -213,7 +214,6 @@ class GPT_warpper(nn.Module):
                 hidden_states = outputs[0] # 🐻 [1, 57, 768]
 
                 logits = self.head_text(hidden_states)
-        
                 logits = logits[:, -1].float()
 
                 logits_token = inputs_ids[:, start_idx:, 0]
@@ -232,7 +232,7 @@ class GPT_warpper(nn.Module):
                 scores = F.softmax(logits, dim=-1)
             
                 idx_next = torch.multinomial(scores, num_samples=1)
-                
+                print(idx_next.shape, idx_next)
                 finish = finish | (idx_next == eos_token).any(1)
                 inputs_ids = torch.cat([inputs_ids, idx_next.unsqueeze(-1).expand(-1, -1, self.num_vq)], 1)
 

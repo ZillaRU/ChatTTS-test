@@ -1,6 +1,6 @@
 import math
 from einops import rearrange
-# from vector_quantize_pytorch import GroupedResidualFSQ
+from vector_quantize_pytorch import GroupedResidualFSQ
 
 import torch
 import torch.nn as nn

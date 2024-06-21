@@ -32,7 +32,7 @@ def infer_code(
     text_token = models['tokenizer'](text, return_tensors='pt', add_special_tokens=False, padding=True).to(device) 
 
     print(text_token)
-    input_ids = text_token['input_ids'][...,None].expand(-1, -1, models['gpt'].num_vq) # torch.Size([1, 66, 4])
+    input_ids = text_token['input_ids'] # [...,None].expand(-1, -1, models['gpt'].num_vq) # torch.Size([1, 66, 4])
     
     inputs = {
         'input_ids': input_ids,
@@ -57,7 +57,7 @@ def infer_code(
     result = models['gpt'].generate_code(
         inputs['input_ids'], 
         spk_emb = spk_emb, # replace 21143
-        temperature = torch.tensor(temperature, device=device), 
+        temperature = temperature, 
         attention_mask = inputs['attention_mask'],
         LogitsWarpers = LogitsWarpers,
         LogitsProcessors = LogitsProcessors,
@@ -92,12 +92,13 @@ def refine_text(
     text_token = models['tokenizer'](text, return_tensors='pt', add_special_tokens=False, padding=True).to(device)
     text_mask = torch.ones(text_token['input_ids'].shape, dtype=bool, device=device)
 
+    print('text_token origin tpu', text_token)
     inputs = {
-        'input_ids': text_token['input_ids'][...,None].expand(-1, -1, models['gpt'].num_vq),
+        'input_ids': text_token['input_ids'], # [...,None].expand(-1, -1, models['gpt'].num_vq),
         'text_mask': text_mask,
         'attention_mask': text_token['attention_mask'],
     }
-    print("text_token origin", text_token)
+    
     LogitsWarpers = []
     if top_P is not None:
         LogitsWarpers.append(TopPLogitsWarper(top_P, min_tokens_to_keep=3))
@@ -110,11 +111,11 @@ def refine_text(
     
     result = models['gpt'].generate_text(
         inputs['input_ids'],
-        temperature = torch.tensor([temperature,], device=device), 
+        temperature = temperature, 
         attention_mask = inputs['attention_mask'],
         LogitsWarpers = LogitsWarpers,
         LogitsProcessors = LogitsProcessors,
-        eos_token = torch.tensor(models['tokenizer'].convert_tokens_to_ids('[Ebreak]'), device=device)[None], # 21136
+        eos_token = 21136, # torch.tensor(models['tokenizer'].convert_tokens_to_ids('[Ebreak]'), device=device)[None], # 21136
         max_new_token = max_new_token, 
         **kwargs
     )

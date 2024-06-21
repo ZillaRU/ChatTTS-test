@@ -7,12 +7,10 @@ from omegaconf import OmegaConf
 import torch
 from vocos import Vocos
 from .model.dvae import DVAE
-from .model.gpt_tpu import GPT_warpper
-# from .model.gpt import GPT_warpper # for tracing onnx
+
 from .utils.gpu_utils import select_device
 from .utils.infer_utils import count_invalid_characters, detect_language, apply_character_map, apply_half2full_map
 from .utils.io_utils import get_latest_modified_file
-from .infer.api import refine_text, infer_code
 
 from huggingface_hub import snapshot_download
 
@@ -20,11 +18,12 @@ logging.basicConfig(level = logging.INFO)
 
 
 class Chat:
-    def __init__(self, ):
+    def __init__(self, device = 'cpu'):
+        self.device = device
         self.pretrain_models = {}
         self.normalizer = {}
         self.logger = logging.getLogger(__name__)
-        
+
     def check_model(self, level = logging.INFO, use_decoder = False):
         not_finish = False
         check_list = ['vocos', 'gpt', 'tokenizer']
@@ -76,6 +75,11 @@ class Chat:
         device: str = None,
         compile: bool = True,
     ):
+        if self.device == 'cpu':
+            from .model.gpt import GPT_warpper
+        else: 
+            from .model.gpt_tpu import GPT_warpper
+        
         if not device:
             device = select_device(4096)
             self.logger.log(logging.INFO, f'use {device}')
@@ -87,13 +91,13 @@ class Chat:
             self.pretrain_models['vocos'] = vocos
             self.logger.log(logging.INFO, 'vocos loaded.')
         
-        # if dvae_config_path:
-        #     cfg = OmegaConf.load(dvae_config_path)
-        #     dvae = DVAE(**cfg).to(device).eval()
-        #     assert dvae_ckpt_path, 'dvae_ckpt_path should not be None'
-        #     dvae.load_state_dict(torch.load(dvae_ckpt_path, map_location='cpu'))
-        #     self.pretrain_models['dvae'] = dvae
-        #     self.logger.log(logging.INFO, 'dvae loaded.')
+        if dvae_config_path:
+            cfg = OmegaConf.load(dvae_config_path)
+            dvae = DVAE(**cfg).to(device).eval()
+            assert dvae_ckpt_path, 'dvae_ckpt_path should not be None'
+            dvae.load_state_dict(torch.load(dvae_ckpt_path, map_location='cpu'))
+            self.pretrain_models['dvae'] = dvae
+            self.logger.log(logging.INFO, 'dvae loaded.')
             
         if gpt_config_path:
             cfg = OmegaConf.load(gpt_config_path)
@@ -137,6 +141,10 @@ class Chat:
         do_text_normalization=True,
         lang=None,
     ):
+        if self.device == 'cpu':
+            from .infer.api import refine_text, infer_code
+        else: 
+            from .infer.api_tpu import refine_text, infer_code
         
         assert self.check_model(use_decoder=use_decoder)
         
