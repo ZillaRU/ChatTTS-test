@@ -19,6 +19,7 @@
 #include "bmruntime_interface.h"
 #include <getopt.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <inttypes.h>
 #include <random>
 #include <numeric>
@@ -49,8 +50,15 @@ private:
   inline void d2d(bm_device_mem_t &dst, bm_device_mem_t &src);
 
   void head_launch(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
+
+  int greedy_search_text(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
+  std::vector<int> greedy_search_code(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
+
   int penalty_sample_text(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
   std::vector<int> penalty_sample_code(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
+
+  // 内联函数用于将uint16_t的半精度浮点数转换为float的单精度浮点数
+  inline float half2float(uint16_t h);
 
 public:
   int text_token_length;
@@ -62,6 +70,7 @@ public:
   bool io_alone;
   std::vector<int> visited_text_tokens;
   std::vector<std::vector<int>> visited_code_tokens;
+  bool DEBUGGING = true;
 
   // generation
   float temperature;
@@ -69,6 +78,8 @@ public:
   float repeat_penalty;
   int repeat_last_n;
   int max_new_tokens;
+  std::string generation_mode_text = "penalty_sample";
+  std::string generation_mode_code = "penalty_sample";
 
 private:
   std::vector<bm_handle_t> handles;
@@ -80,6 +91,7 @@ private:
   const bm_net_info_t *net_embed_text_cache, *net_embed_code_cache;
   const bm_net_info_t *net_lm_text, *net_lm_code;
   const bm_net_info_t *net_penalty_sample_head_text, *net_penalty_sample_head_code;
+  const bm_net_info_t *net_greedy_head_text, *net_greedy_head_code;
   std::vector<bm_device_mem_t> past_key;
   std::vector<bm_device_mem_t> past_value;
 };
@@ -112,6 +124,35 @@ void TTSLlama::d2d(bm_device_mem_t &dst, bm_device_mem_t &src)
 {
   bm_memcpy_d2d_byte(bm_handle, dst, 0, src, 0, bm_mem_get_device_size(src));
 }
+
+
+float TTSLlama::half2float(uint16_t x)
+{
+    unsigned sign = ((x >> 15) & 1);
+    unsigned exponent = ((x >> 10) & 0x1f);
+    unsigned mantissa = ((x & 0x3ff) << 13);
+    if (exponent == 0x1f) {  /* NaN or Inf */
+        mantissa = (mantissa ? (sign = 0, 0x7fffff) : 0);
+        exponent = 0xff;
+    } else if (!exponent) {  /* Denorm or Zero */
+        if (mantissa) {
+            unsigned int msb;
+            exponent = 0x71;
+            do {
+                msb = (mantissa & 0x400000);
+                mantissa <<= 1;  /* normalize */
+                --exponent;
+            } while (!msb);
+            mantissa &= 0x7fffff;  /* 1.mantissa is implicit */
+        }
+    } else {
+        exponent += 0x70;
+    }
+    int temp = ((sign << 31) | (exponent << 23) | mantissa);
+ 
+    return *((float*)((void*)&temp));
+}
+
 
 void TTSLlama::init(const std::vector<int> &devices, std::string model_path)
 {
@@ -158,11 +199,14 @@ void TTSLlama::init(const std::vector<int> &devices, std::string model_path)
   net_penalty_sample_head_text = bmrt_get_network_info(p_bmrt, "penalty_sample_head_text");
   net_penalty_sample_head_code = bmrt_get_network_info(p_bmrt, "penalty_sample_head_code");
 
+  net_greedy_head_text = bmrt_get_network_info(p_bmrt, "greedy_head_text");
+  net_greedy_head_code = bmrt_get_network_info(p_bmrt, "greedy_head_code");
+
   SEQLEN = net_embed_text->stages[0].input_shapes[0].dims[1]; // real seqlen
   printf("SEQLEN: %d\n", SEQLEN);
   auto num_nets = bmrt_get_network_number(p_bmrt);
-
-  NUM_LAYERS = (num_nets - 8) / 2;
+  printf("num_nets: %d\n", num_nets);
+  NUM_LAYERS = 20; // (num_nets - 10) / 2;
   hidden_size = net_embed_text->stages[0].output_shapes[0].dims[2];
   NUM_VQ = net_penalty_sample_head_code->stages[0].output_shapes[0].dims[1];
   printf("NUM_LAYERS: %d, hidden_size: %d, NUM_VQ: %d\n", NUM_LAYERS, hidden_size, NUM_VQ);
@@ -255,6 +299,14 @@ void TTSLlama::head_launch(const bm_net_info_t *net, bm_device_mem_t &logits_mem
   bm_thread_sync(bm_handle);
 }
 
+int TTSLlama::greedy_search_text(const bm_net_info_t *net, bm_device_mem_t &logits_mem) {
+  auto &out_mem = net->stages[0].output_mems[0];
+  head_launch(net, logits_mem);
+  int token = 0;
+  bm_memcpy_d2s(bm_handle, (void *)&token, out_mem);
+  return token;
+}
+
 int TTSLlama::penalty_sample_text(const bm_net_info_t *net, bm_device_mem_t &logits_mem)
 {
   auto &in1_mem = net->stages[0].input_mems[1];
@@ -336,6 +388,18 @@ int TTSLlama::forward_first_text(std::vector<int> &tokens)
     out_mem = net_blocks[idx]->stages[0].output_mems[0];
     d2d(past_key[idx], net_blocks[idx]->stages[0].output_mems[1]);
     d2d(past_value[idx], net_blocks[idx]->stages[0].output_mems[2]);
+    
+    // debug
+    if(DEBUGGING) {
+      std::vector<uint16_t> temp(SEQLEN * hidden_size, 0);
+      bm_memcpy_d2s(bm_handle, temp.data(), out_mem);
+      printf("forward first text layer %d\n", idx);
+      for (int i = 0; i < hidden_size; i++)
+      {
+        if(i%5 == 0) printf("\n");
+        printf("%.04f ", half2float(temp[(text_token_length-1)*hidden_size + i]));
+      }
+    }
   }
 
   // forward lmhead
@@ -347,8 +411,12 @@ int TTSLlama::forward_first_text(std::vector<int> &tokens)
   net_launch(net_lm_text);
 
   int token = 0;
-  token = penalty_sample_text(net_penalty_sample_head_text, lm_out_mem); // size = 84712
-
+  if (generation_mode_text == "greedy") {
+    token = greedy_search_text(net_greedy_head_text, lm_out_mem);
+  }
+  else if (generation_mode_text == "penalty_sample") {
+    token = penalty_sample_text(net_penalty_sample_head_text, lm_out_mem); // size = 84712
+  }
   visited_text_tokens[text_token_length] = token;
   text_token_length += 1;
   return token;
@@ -415,6 +483,18 @@ int TTSLlama::forward_next_text()
                        bytes);
     bm_memcpy_d2d_byte(bm_handle, past_value[idx], token_offset, out2_mem, 0,
                        bytes);
+    
+    // debug
+    if(DEBUGGING) {
+      std::vector<uint16_t> temp(hidden_size, 0);
+      bm_memcpy_d2s(bm_handle, temp.data(), out0_mem);
+      printf("\nforward next text layer %d\n", idx);
+      for (int i = 0; i < hidden_size; i++)
+      {
+        if(i%5 == 0) printf("\n");
+        printf("%.04f ", half2float(temp[i]));
+      }
+    }
   }
 
   // forward lmhead
@@ -424,7 +504,12 @@ int TTSLlama::forward_next_text()
   net_launch(net_lm_text);
 
   int token = 0;
-  token = penalty_sample_text(net_penalty_sample_head_text, lm_out_mem);
+  if (generation_mode_text == "greedy") {
+    token = greedy_search_text(net_greedy_head_text, lm_out_mem);
+  }
+  else if (generation_mode_text == "penalty_sample") {
+    token = penalty_sample_text(net_penalty_sample_head_text, lm_out_mem); // size = 84712
+  }
 
   visited_text_tokens[text_token_length] = token;
   text_token_length += 1;
@@ -459,6 +544,14 @@ std::vector<int> TTSLlama::generate_text(std::vector<int> &history_tokens, int E
     token = forward_next_text();
   }
   return result_tokens;
+}
+
+std::vector<int> TTSLlama::greedy_search_code(const bm_net_info_t *net, bm_device_mem_t &logits_mem) {
+  auto &out_mem = net->stages[0].output_mems[0];
+  head_launch(net, logits_mem);
+  std::vector<int> token(NUM_VQ, 0);
+  bm_memcpy_d2s(bm_handle, (void *)&token, out_mem);
+  return token;
 }
 
 std::vector<int> TTSLlama::penalty_sample_code(const bm_net_info_t *net, bm_device_mem_t &logits_mem)
@@ -549,8 +642,21 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_first_code(
   bm_memcpy_s2d(bm_handle, in_mem, (void *)tokens.data()); // i == 0##########
   printf("token_length: %d\n", code_token_length);
   net_launch(net_embed_text); // prefil embedding
-  std::vector<uint16_t> tmp_emb(768*512, 0); // debug
-  bm_memcpy_d2s(bm_handle, tmp_emb.data(), out_mem); // debug
+
+  if(DEBUGGING) {
+    std::vector<uint16_t> tmp_emb(SEQLEN*hidden_size, 0); // debug
+    bm_memcpy_d2s(bm_handle, tmp_emb.data(), out_mem); // debug
+    // debug
+    for(int t = 0; t < code_token_length; t++) {
+      for (int i = 0; i < hidden_size; i++)
+      {
+        if(i%5 == 0) printf("\n");
+        printf("%.04f ", half2float(tmp_emb[t*hidden_size + i]));
+      }
+      printf("================== \n");
+    }
+  }
+  
   // the embedding of empty_spk --> spk_emb
   if (idx_spk != -1)
   {
@@ -573,8 +679,21 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_first_code(
     }
     net_launch(net_blocks[idx]);
     out_mem = net_blocks[idx]->stages[0].output_mems[0]; // hiddens
+    
     d2d(past_key[idx], net_blocks[idx]->stages[0].output_mems[1]);
     d2d(past_value[idx], net_blocks[idx]->stages[0].output_mems[2]);
+
+    // debug
+    if(DEBUGGING) {
+      std::vector<uint16_t> temp(hidden_size*SEQLEN, 0);
+      bm_memcpy_d2s(bm_handle, temp.data(), out_mem);
+      printf("\nforward first code layer %d\n", idx);
+      for (int i = 0; i < hidden_size; i++)
+      {
+        if(i%5 == 0) printf("\n");
+        printf("%.04f ", half2float(temp[(code_token_length-1)*hidden_size + i]));
+      }
+    }
   }
 
   // forward lmhead
@@ -585,8 +704,27 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_first_code(
                      (code_token_length - 1) * bytes, bytes);
   net_launch(net_lm_code); // B
 
+
+  // debug
+  if(DEBUGGING) { // bug here
+    std::vector<float> temp(626*4, 0);
+    bm_memcpy_d2s(bm_handle, temp.data(), lm_out_mem);
+    printf("\nAfter lmhead\n");
+    for (int i = 0; i < int(temp.size()); i++)
+    {
+      if (i % 626 == 0) printf(" ====================== ");
+      if(i%5 == 0) printf("\n");
+      printf("%.04f ", temp[i]);
+    }
+  }
+
   std::vector<int> token;
-  token = penalty_sample_code(net_penalty_sample_head_code, lm_out_mem);
+
+  if (generation_mode_code == "greedy") {
+    token = greedy_search_code(net_greedy_head_code, lm_out_mem);
+  } else if (generation_mode_code == "penalty_sample") {
+    token = penalty_sample_code(net_penalty_sample_head_code, lm_out_mem);
+  }
 
   std::vector<uint16_t> last_hidden(hidden_size, 0);
   bm_memcpy_d2s_partial_offset(bm_handle, (void *)last_hidden.data(), out_mem, bytes, (code_token_length - 1) * bytes); // ##### 1*512*12*64*[2B]
@@ -662,7 +800,7 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_next_code()
                        bytes);
   }
 
-  std::vector<uint16_t> last_hidden(hidden_size, 0);
+  std::vector<uint16_t> last_hidden(hidden_size, 0);  // debug
   bm_memcpy_d2s(bm_handle, (void *)last_hidden.data(), out_mem);
 
   // forward lmhead
@@ -672,7 +810,12 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_next_code()
   net_launch(net_lm_code);
 
   std::vector<int> token(NUM_VQ, 0);
-  token = penalty_sample_code(net_penalty_sample_head_code, lm_out_mem);
+
+  if (generation_mode_code == "greedy") {
+    token = greedy_search_code(net_greedy_head_code, lm_out_mem);
+  } else if (generation_mode_code == "penalty_sample") {
+    token = penalty_sample_code(net_penalty_sample_head_code, lm_out_mem);
+  }
 
   visited_code_tokens[code_token_length] = token;
   code_token_length += 1;
@@ -719,6 +862,16 @@ py::dict TTSLlama::generate_code(std::vector<int> &history_tokens, int idx_spk, 
   {
     result_tokens.emplace_back(token);
     result_hiddens.emplace_back(curr_res.second);
+
+    // debug
+    if(DEBUGGING) {
+      printf("\n================code_token_length = %d", code_token_length);
+      for(int i = 0; i < int(curr_res.second.size()); i++){
+        if(i%5==0){printf("\n");}
+        printf("%.04f ", half2float(curr_res.second[i]));
+      }
+      printf("\n");
+    }
     curr_res = forward_next_code();
     token = curr_res.first;
     for(int i = 0; i < int(token.size()); i++){
@@ -745,10 +898,13 @@ PYBIND11_MODULE(llama, m)
       .def("forward_first_code", &TTSLlama::forward_first_code)
       .def("forward_next_code", &TTSLlama::forward_next_code)
       .def("generate_code", &TTSLlama::generate_code)
+      .def_readwrite("generation_mode_text", &TTSLlama::generation_mode_text)
+      .def_readwrite("generation_mode_code", &TTSLlama::generation_mode_code)
       .def_readwrite("SEQLEN", &TTSLlama::SEQLEN) // read SEQLEN in pipeline.py
       .def_readwrite("temperature", &TTSLlama::temperature)
       .def_readwrite("top_p", &TTSLlama::top_p)
       .def_readwrite("repeat_penalty", &TTSLlama::repeat_penalty)
       .def_readwrite("repeat_last_n", &TTSLlama::repeat_last_n)
-      .def_readwrite("max_new_tokens", &TTSLlama::max_new_tokens);
+      .def_readwrite("max_new_tokens", &TTSLlama::max_new_tokens)
+      .def_readwrite("DEBUGGING", &TTSLlama::DEBUGGING);
 }

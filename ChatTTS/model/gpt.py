@@ -120,13 +120,14 @@ class GPT_warpper(nn.Module):
                 
                 model_input['input_ids'] = None
                 print("emb", model_input['inputs_embeds'].shape)
+                breakpoint()
                 outputs = self.gpt.forward(**model_input, output_attentions=False)
                 print("code hidden", outputs[0].shape)
                 hidden_states = outputs[0] # 🐻 [1, 57, 768]
                 hiddens.append(hidden_states[:, -1])
 
                 logits = torch.stack([self.head_code[i](hidden_states) for i in range(self.num_vq)], 3) #torch.Size([1, 18, 626, 4])
-                breakpoint()
+                
                 logits = logits[:, -1].float()
 
                 logits = rearrange(logits, "b c n -> (b n) c")
@@ -163,7 +164,7 @@ class GPT_warpper(nn.Module):
                     
             if not finish.all():
                 self.logger.warn(f'Incomplete result. hit max_new_token: {max_new_token}')    
-            
+            breakpoint()
             return {
                 'ids': inputs_ids, # [505,4]
                 'hiddens':hiddens, #[505, 768]
@@ -235,6 +236,7 @@ class GPT_warpper(nn.Module):
                 print(idx_next.shape, idx_next)
                 finish = finish | (idx_next == eos_token).any(1)
                 inputs_ids = torch.cat([inputs_ids, idx_next.unsqueeze(-1).expand(-1, -1, self.num_vq)], 1)
+                # breakpoint()
 
                 end_idx = end_idx + (~finish).int()
             
@@ -243,7 +245,7 @@ class GPT_warpper(nn.Module):
             
             inputs_ids = [inputs_ids[idx, start_idx: start_idx+i] for idx, i in enumerate(end_idx.int())]
             inputs_ids = [i[:, 0] for i in inputs_ids]
-            
+            breakpoint()
             if not finish.all():
                 self.logger.warn(f'Incomplete result. hit max_new_token: {max_new_token}')    
             

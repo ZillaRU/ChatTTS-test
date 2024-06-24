@@ -38,6 +38,7 @@ class GPT_warpper(nn.Module):
         self.gpt.SEQLEN = 512
         self.gpt.top_p = 0.7
         # self.gpt.top_k = 20
+        self.gpt.DEBUGGING = True
         self.gpt.temperature = 0.7
         self.gpt.repeat_penalty = 1.0
         self.gpt.repeat_last_n = 3
@@ -71,11 +72,11 @@ class GPT_warpper(nn.Module):
         inputs_ids_list = inputs_ids[0].tolist()
         
         res = self.gpt.generate_code(inputs_ids_list, spk_idx, spk_emb, eos_token, temperature)
-        breakpoint()
         print(res['tokens'])
         res['ids'] = torch.tensor(res['tokens'], dtype=torch.int64).unsqueeze(0)
         print(res['ids'].shape)
-        hiddens_np = np.array(res['hiddens'], dtype=np.uint16).astype(np.float32)
+        hiddens_np = np.array(res['hiddens'], dtype=np.uint16).view(np.float16).astype(np.float32)/100
+        breakpoint()
         # cpp中实际是从device mem拷贝的fp16数值（但vector定义中写的是uint16），这里直接按fp16读取
         res['hiddens'] = torch.from_numpy(hiddens_np).unsqueeze(0)
         return res
@@ -97,6 +98,8 @@ class GPT_warpper(nn.Module):
         self.gpt.temperature = temperature
         self.gpt.repeat_penalty = 1.0
         inputs_ids = self.gpt.generate_text(inputs_ids_list, eos_token, temperature)
+        # inputs_ids_list += inputs_ids
+        # inputs_ids = torch.tensor(inputs_ids_list, dtype=torch.int64).unsqueeze(0).unsqueeze(0)
         inputs_ids = torch.tensor(inputs_ids, dtype=torch.int64).unsqueeze(0).unsqueeze(0)
         print(inputs_ids.shape)
         breakpoint()

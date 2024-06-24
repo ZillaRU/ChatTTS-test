@@ -353,6 +353,7 @@ class LmHead_infer_code(torch.nn.Module):
     
     def forward(self, hidden_states):
         # hidden_states = gpt_model.norm(hidden_states)
+        breakpoint()
         m_logits = torch.stack([chat.pretrain_models['gpt'].head_code[i](hidden_states) for i in range(chat.pretrain_models['gpt'].num_vq)], 2)
         return m_logits
 
@@ -371,7 +372,7 @@ def convert_lm_head_text():
 def convert_lm_head_code():
     model = LmHead_infer_code()
     input = torch.randn(1, HIDDEN_SIZE)
-
+    print(input.shape)
     torch.onnx.export(model, (input),
                       f'{folder}/lm_head_code.onnx',
                       verbose=False,
@@ -386,15 +387,15 @@ if not os.path.exists(folder):
 
 
 # export models
-print(f'Convert block & block_cache')
-for i in tqdm(range(NUM_OF_LAYERS)):
-    convert_block_cache(i)
-    convert_block(i)
+# print(f'Convert block & block_cache')
+# for i in tqdm(range(NUM_OF_LAYERS)):
+#     convert_block_cache(i)
+#     convert_block(i)
 
-print(f'Convert embedding')
-convert_embedding_text()
-convert_embedding_code()
-convert_embedding_code_cache()
+# print(f'Convert embedding')
+# convert_embedding_text()
+# convert_embedding_code()
+# convert_embedding_code_cache()
 
 print(f'Convert lm_head')
 convert_lm_head_code()
