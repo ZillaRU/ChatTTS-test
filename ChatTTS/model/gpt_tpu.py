@@ -32,7 +32,7 @@ class GPT_warpper(nn.Module):
         import llama
         self.logger = logging.getLogger(__name__)
         self.gpt = llama.TTSLlama()
-        self.gpt.init([0], './chattts-llama_int8_1dev_512.bmodel')
+        self.gpt.init([0], './chattts-llama_bf16_1dev_512.bmodel')
         self.num_vq = num_vq
         self.gpt.max_new_tokens = 512
         self.gpt.SEQLEN = 512
@@ -41,7 +41,6 @@ class GPT_warpper(nn.Module):
         self.gpt.DEBUGGING = True
         self.gpt.temperature = 0.7
         self.gpt.repeat_penalty = 1.0
-        self.gpt.repeat_last_n = 3
 
     def generate_code(
         self,

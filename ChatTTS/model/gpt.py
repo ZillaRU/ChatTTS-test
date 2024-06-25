@@ -130,8 +130,8 @@ class GPT_warpper(nn.Module):
                 
                 logits = logits[:, -1].float()
 
-                logits = rearrange(logits, "b c n -> (b n) c")
-                logits_token = rearrange(inputs_ids[:, start_idx:], "b c n -> (b n) c")
+                logits = rearrange(logits, "b c n -> (b n) c") # 1 626 4 ， 4 626
+                logits_token = rearrange(inputs_ids[:, start_idx:], "b c n -> (b n) c") # [1, 1, 4] [4,1]
 
                 logits = logits / temperature
                 

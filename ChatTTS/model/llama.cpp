@@ -63,6 +63,8 @@ private:
 public:
   int text_token_length;
   int code_token_length;
+  int new_code_token_length;
+  int new_text_token_length;
   int hidden_size; // read from bmodel
   int SEQLEN;      // read from bmodel
   int NUM_LAYERS;  // read from bmodel
@@ -76,10 +78,9 @@ public:
   float temperature;
   float top_p;
   float repeat_penalty;
-  int repeat_last_n;
   int max_new_tokens;
   std::string generation_mode_text = "penalty_sample";
-  std::string generation_mode_code = "penalty_sample";
+  std::string generation_mode_code = "hidden_states";
 
 private:
   std::vector<bm_handle_t> handles;
@@ -197,7 +198,7 @@ void TTSLlama::init(const std::vector<int> &devices, std::string model_path)
   net_lm_code = bmrt_get_network_info(p_bmrt, "lm_head_code");
 
   net_penalty_sample_head_text = bmrt_get_network_info(p_bmrt, "penalty_sample_head_text");
-  net_penalty_sample_head_code = bmrt_get_network_info(p_bmrt, "penalty_sample_head_code");
+  net_penalty_sample_head_code = bmrt_get_network_info(p_bmrt, "chattts_sample_head_code");
 
   net_greedy_head_text = bmrt_get_network_info(p_bmrt, "greedy_head_text");
   net_greedy_head_code = bmrt_get_network_info(p_bmrt, "greedy_head_code");
@@ -208,7 +209,7 @@ void TTSLlama::init(const std::vector<int> &devices, std::string model_path)
   printf("num_nets: %d\n", num_nets);
   NUM_LAYERS = 20; // (num_nets - 10) / 2;
   hidden_size = net_embed_text->stages[0].output_shapes[0].dims[2];
-  NUM_VQ = net_penalty_sample_head_code->stages[0].output_shapes[0].dims[1];
+  NUM_VQ = net_penalty_sample_head_code->stages[0].output_shapes[0].dims[0];
   printf("NUM_LAYERS: %d, hidden_size: %d, NUM_VQ: %d\n", NUM_LAYERS, hidden_size, NUM_VQ);
 
   // resize
@@ -318,7 +319,7 @@ int TTSLlama::penalty_sample_text(const bm_net_info_t *net, bm_device_mem_t &log
 
   // repeat_penalty + top_p + top_k + temperature
   std::vector<int> generated_tokens(SEQLEN, visited_text_tokens[text_token_length - 1]); // #####
-  repeat_last_n = std::min(repeat_last_n, text_token_length);
+  int repeat_last_n = std::min(repeat_last_n, text_token_length); //################
   std::copy(visited_text_tokens.begin() + text_token_length - repeat_last_n,
             visited_text_tokens.begin() + text_token_length,
             generated_tokens.begin());
@@ -536,11 +537,13 @@ std::vector<int> TTSLlama::generate_text(std::vector<int> &history_tokens, int E
   std::fill(visited_text_tokens.begin(), visited_text_tokens.end(), 0);
   temperature = temp_tempreature;
 
+  new_text_token_length = 0;
   std::vector<int> result_tokens;
   int token = forward_first_text(history_tokens);
   while (token != EOS && text_token_length < SEQLEN)
   {
     result_tokens.emplace_back(token);
+    new_text_token_length += 1;
     token = forward_next_text();
   }
   return result_tokens;
@@ -556,52 +559,60 @@ std::vector<int> TTSLlama::greedy_search_code(const bm_net_info_t *net, bm_devic
 
 std::vector<int> TTSLlama::penalty_sample_code(const bm_net_info_t *net, bm_device_mem_t &logits_mem)
 {
-  auto &in1_mem = net->stages[0].input_mems[1];
+  auto &in1_mem = net->stages[0].input_mems[1]; // 0m_logits, 1input_ids, valid_token_len, penalty, temperature
   auto &in2_mem = net->stages[0].input_mems[2];
   auto &in3_mem = net->stages[0].input_mems[3];
   auto &in4_mem = net->stages[0].input_mems[4];
   auto &out0_mem = net->stages[0].output_mems[0];
-  auto &out1_mem = net->stages[0].output_mems[1];
 
   // repeat_penalty + top_p + top_k + temperature
-  std::vector<int> generated_tokens(SEQLEN * NUM_VQ, 0); // ##### visited_tokens[token_length - 1]
+  std::vector<int> generated_tokens(16 * NUM_VQ, 0); // ##### visited_tokens[token_length - 1]
 
-  for(int i = 0; i < SEQLEN; i++)
+  for(int i = 0; i < 16; i++)
   {
     for(int j = 0; j < NUM_VQ; j++)
     {
       generated_tokens[i * NUM_VQ + j] = visited_code_tokens[code_token_length - 1][j];
     }
   }
-  repeat_last_n = std::min(repeat_last_n, code_token_length);
-
-  for (int i = 0; i < repeat_last_n; ++i) 
+  int st_idx = code_token_length - std::min(16, new_code_token_length);
+  for (int i = st_idx; i < code_token_length; ++i) 
   {
-      std::copy(visited_code_tokens[code_token_length - repeat_last_n + i].begin(), visited_code_tokens[code_token_length - repeat_last_n + i].end(), generated_tokens.begin() + i * NUM_VQ);
+      std::copy(visited_code_tokens[i].begin(), visited_code_tokens[i].end(), generated_tokens.begin() + (i-st_idx) * NUM_VQ);
   }
   
   bm_memcpy_s2d(bm_handle, in1_mem, (void *)generated_tokens.data());
-  bm_memcpy_s2d(bm_handle, in2_mem, (void *)&top_p);
-  bm_memcpy_s2d(bm_handle, in3_mem, (void *)&temperature);
-  bm_memcpy_s2d(bm_handle, in4_mem, (void *)&repeat_penalty);
+  bm_memcpy_s2d(bm_handle, in2_mem, (void *)&new_code_token_length);
+  bm_memcpy_s2d(bm_handle, in3_mem, (void *)&repeat_penalty);
+  bm_memcpy_s2d(bm_handle, in4_mem, (void *)&temperature);
 
   // inference
   head_launch(net, logits_mem);
 
   // get logit & token
-  int candidate_num = net->stages[0].output_shapes[0].dims[2];
-  std::vector<float> probs_flat(NUM_VQ * candidate_num);
-  std::vector<float> tokens_flat(NUM_VQ * candidate_num); // caution: the output tokens of penalty_sample_head_code is [float] not [int]
+  int num_code = net->stages[0].output_shapes[0].dims[1];
+  std::vector<float> probs_flat(NUM_VQ * num_code);
+  // std::vector<float> tokens_flat(NUM_VQ * candidate_num); // caution: the output tokens of penalty_sample_head_code is [float] not [int]
 
   bm_memcpy_d2s(bm_handle, probs_flat.data(), out0_mem);
-  bm_memcpy_d2s(bm_handle, tokens_flat.data(), out1_mem);
+
+  if(DEBUGGING) 
+  {
+    std::cout << "probs_flat:" << std::endl;
+    for(int i = 0; i < int(probs_flat.size()); i++)
+    {
+      std::cout << probs_flat[i] << " ";
+      if(i % 10 == 9) std::cout << std::endl;
+    }
+    std::cout << std::endl;
+  }
 
   std::vector<int> curr_token(NUM_VQ, 0);
   // penalty_sample
   for(int i = 0; i < NUM_VQ; i++)
   {
-    std::discrete_distribution<> dist(probs_flat.begin()+i*candidate_num, probs_flat.begin()+(i+1)*candidate_num);
-    curr_token[i] = int(tokens_flat[i*candidate_num + dist(sgen)]);
+    std::discrete_distribution<> dist(probs_flat.begin()+i*num_code, probs_flat.begin()+(i+1)*num_code);
+    curr_token[i] = int(dist(sgen));
   }
   return curr_token;
 }
@@ -695,18 +706,29 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_first_code(
       }
     }
   }
-
+  // (bm_handle, past_value[idx], token_offset, out2_mem, 0, bytes);
   // forward lmhead
   int bytes = out_mem.size / SEQLEN;
   auto &lm_in_mem = net_lm_code->stages[0].input_mems[0];
   auto &lm_out_mem = net_lm_code->stages[0].output_mems[0];
   bm_memcpy_d2d_byte(bm_handle, lm_in_mem, 0, out_mem,
                      (code_token_length - 1) * bytes, bytes);
+
+  if(DEBUGGING) { 
+    printf("\nBefore lmhead\n"); // bug here
+    std::vector<uint16_t> temp0(hidden_size, 0);
+    bm_memcpy_d2s(bm_handle, temp0.data(), lm_in_mem);
+    for (int i = 0; i < int(temp0.size()); i++)
+    {
+      if(i%5 == 0) printf("\n");
+      printf("%.04f ", half2float(temp0[i]));
+    }
+  }
+
   net_launch(net_lm_code); // B
 
-
   // debug
-  if(DEBUGGING) { // bug here
+  if(DEBUGGING) { 
     std::vector<float> temp(626*4, 0);
     bm_memcpy_d2s(bm_handle, temp.data(), lm_out_mem);
     printf("\nAfter lmhead\n");
@@ -718,16 +740,24 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_first_code(
     }
   }
 
+  std::vector<uint16_t> last_hidden(hidden_size, 0);
+  bm_memcpy_d2s_partial_offset(bm_handle, (void *)last_hidden.data(), out_mem, bytes, (code_token_length - 1) * bytes); // ##### 1*512*12*64*[2B]
+  if(DEBUGGING) {
+    printf("\nlast hidden\n"); 
+    for (int i = 0; i < int(last_hidden.size()); i++) 
+    { printf("%.04f ", half2float(last_hidden[i])); }
+    printf("\n");
+  }  
+
   std::vector<int> token;
 
   if (generation_mode_code == "greedy") {
     token = greedy_search_code(net_greedy_head_code, lm_out_mem);
   } else if (generation_mode_code == "penalty_sample") {
     token = penalty_sample_code(net_penalty_sample_head_code, lm_out_mem);
+  } else {
+    token.resize(NUM_VQ, 0); // ################
   }
-
-  std::vector<uint16_t> last_hidden(hidden_size, 0);
-  bm_memcpy_d2s_partial_offset(bm_handle, (void *)last_hidden.data(), out_mem, bytes, (code_token_length - 1) * bytes); // ##### 1*512*12*64*[2B]
 
   visited_code_tokens[code_token_length] = token;
   code_token_length += 1;
@@ -846,6 +876,7 @@ py::dict TTSLlama::generate_code(std::vector<int> &history_tokens, int idx_spk, 
 
   temperature = temp_tempreature;
   printf("temperature: %f\n", temperature);
+  new_code_token_length = 0;
   std::vector<std::vector<int>> result_tokens;
   std::vector<std::vector<uint16_t>> result_hiddens;
   std::pair<std::vector<int>, std::vector<uint16_t>> curr_res = forward_first_code(history_tokens, idx_spk, spk_emb);
@@ -862,7 +893,7 @@ py::dict TTSLlama::generate_code(std::vector<int> &history_tokens, int idx_spk, 
   {
     result_tokens.emplace_back(token);
     result_hiddens.emplace_back(curr_res.second);
-
+    new_code_token_length += 1;
     // debug
     if(DEBUGGING) {
       printf("\n================code_token_length = %d", code_token_length);
@@ -904,7 +935,6 @@ PYBIND11_MODULE(llama, m)
       .def_readwrite("temperature", &TTSLlama::temperature)
       .def_readwrite("top_p", &TTSLlama::top_p)
       .def_readwrite("repeat_penalty", &TTSLlama::repeat_penalty)
-      .def_readwrite("repeat_last_n", &TTSLlama::repeat_last_n)
       .def_readwrite("max_new_tokens", &TTSLlama::max_new_tokens)
       .def_readwrite("DEBUGGING", &TTSLlama::DEBUGGING);
 }

@@ -196,19 +196,39 @@ model_deploy.py \
     --chip bm1684x \
     --model penalty_sample_head_text.bmodel
 
-model_transform.py \
-    --model_name penalty_sample_head_code \
-    --model_def ../../onnx/penalty_sample_head_code.onnx \
-    --mlir penalty_sample_head_code.mlir
+# model_transform.py \
+#     --model_name chattts_sample_head_code \
+#     --model_def ../../onnx/chattts_sample_head_code.onnx \
+#     --mlir chattts_sample_head_code.mlir \
+#     --test_input ./../onnx/chattts_sample_head_code_input.npz
 
 model_deploy.py \
-    --mlir penalty_sample_head_code.mlir \
+    --mlir chattts_sample_head_code.mlir \
     --chip bm1684x \
-    --model penalty_sample_head_code.bmodel
+    --model chattts_sample_head_code.bmodel
 
+# model_transform.py \
+#     --model_name greedy_head_text \
+#     --model_def ../../onnx/greedy_head_text.onnx \
+#     --mlir greedy_head_text.mlir
+
+# model_deploy.py \
+#     --mlir greedy_head_text.mlir \
+#     --chip bm1684x \
+#     --model greedy_head_text.bmodel
+
+# model_transform.py \
+#     --model_name greedy_head_code \
+#     --model_def ../../onnx/greedy_head_code.onnx \
+#     --mlir greedy_head_code.mlir
+
+# model_deploy.py \
+#     --mlir greedy_head_code.mlir \
+#     --chip bm1684x \
+#     --model greedy_head_code.bmodel
 rm *.npz
 
-models=${models}${outdir}'/lm_head_text.bmodel '$outdir'/lm_head_code.bmodel '$outdir'/penalty_sample_head_text.bmodel '$outdir'/penalty_sample_head_code.bmodel '
+models=${models}${outdir}'/lm_head_text.bmodel '$outdir'/lm_head_code.bmodel '$outdir'/penalty_sample_head_text.bmodel '$outdir'/chattts_sample_head_code.bmodel '
 popd
 
 echo $models

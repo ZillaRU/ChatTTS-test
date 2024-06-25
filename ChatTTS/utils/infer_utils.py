@@ -14,11 +14,12 @@ class CustomRepetitionPenaltyLogitsProcessorRepeat():
         self.max_input_ids = max_input_ids
         self.past_window = past_window
 
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        
-        input_ids = input_ids[:, -self.past_window:]
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, valid_seq_len=None) -> torch.FloatTensor:
+        if valid_seq_len is None:
+            valid_seq_len = self.past_window
+        input_ids = input_ids[:, -valid_seq_len:] ###
         freq = F.one_hot(input_ids, scores.size(1)).sum(1)
-        freq[self.max_input_ids:] = 0
+        freq[self.max_input_ids:] = 0 ### 
         alpha = self.penalty**freq
         scores = torch.where(scores < 0, scores*alpha, scores/alpha)
 
