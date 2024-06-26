@@ -126,9 +126,9 @@ class EmbeddingCodeCache(torch.nn.Module):  # for forward_next_code
 
 def convert_embedding_code_cache():
     model = EmbeddingCodeCache()
-    input_ids = torch.tensor([[range(chat.pretrain_models['gpt'].num_vq)]])
+    input_ids = torch.tensor([[[416, 290, 166, 212]]]) # torch.tensor([[range(chat.pretrain_models['gpt'].num_vq)]])
     print(input_ids.shape)
-
+    breakpoint()
     torch.onnx.export(model, (input_ids),
                       f'{folder}/embedding_code_cache.onnx',
                       verbose=False,
@@ -450,7 +450,7 @@ if not os.path.exists(folder):
 # print(f'Convert embedding')
 # convert_embedding_text()
 # convert_embedding_code()
-# convert_embedding_code_cache()
+convert_embedding_code_cache()
 
 # print(f'Convert lm_head')
 # convert_lm_head_code()
@@ -463,5 +463,5 @@ if not os.path.exists(folder):
 print(f'Convert penalty_sample_head')
 # convert_penalty_sample_head_text(TEXT_VOCAB_SIZE)
 # convert_penalty_sample_head_code(AUDIO_VOCAB_SIZE)
-convert_chattts_sample_head_code()
+# convert_chattts_sample_head_code()
 print("Done")

@@ -21,8 +21,8 @@ def infer_code(
     if not isinstance(text, list): 
         text = [text]
         
-    # if not isinstance(temperature, list):
-    #     temperature = [temperature] * models['gpt'].num_vq
+    if not isinstance(temperature, list):
+        temperature = [temperature] * models['gpt'].num_vq
     
     if spk_emb is not None:
         text = [f'[Stts][spk_emb]{i}[Ptts]' for i in text] 
@@ -57,7 +57,7 @@ def infer_code(
     result = models['gpt'].generate_code(
         inputs['input_ids'], 
         spk_emb = spk_emb, # replace 21143
-        temperature = temperature, 
+        temperature = torch.tensor(temperature, device=device), # temperature, 
         attention_mask = inputs['attention_mask'],
         LogitsWarpers = LogitsWarpers,
         LogitsProcessors = LogitsProcessors,
@@ -111,7 +111,7 @@ def refine_text(
     
     result = models['gpt'].generate_text(
         inputs['input_ids'],
-        temperature = temperature, 
+        temperature = torch.tensor(temperature, device=device), # temperature, 
         attention_mask = inputs['attention_mask'],
         LogitsWarpers = LogitsWarpers,
         LogitsProcessors = LogitsProcessors,

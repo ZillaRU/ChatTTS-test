@@ -78,7 +78,8 @@ class Chat:
         if self.device == 'cpu':
             from .model.gpt import GPT_warpper
         else: 
-            from .model.gpt_tpu import GPT_warpper
+            # from .model.gpt_tpu import GPT_warpper
+            from .model.gpt_tpu_tmp import GPT_warpper
         
         if not device:
             device = select_device(4096)

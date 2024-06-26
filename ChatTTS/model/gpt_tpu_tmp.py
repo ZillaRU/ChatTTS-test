@@ -4,15 +4,14 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import logging
 from tqdm import tqdm
 from einops import rearrange
-# from transformers.cache_utils import Cache
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.utils.parametrize as P
 from torch.nn.utils.parametrizations import weight_norm
-from transformers import LlamaModel, LlamaConfig
-    
+import sys
+module_path = "./ChatTTS/model"
+if module_path not in sys.path:
+    sys.path.append(module_path)
 
 class GPT_warpper(nn.Module):
     def __init__(
@@ -24,58 +23,19 @@ class GPT_warpper(nn.Module):
         **kwargs,
         ):
         super().__init__()
-
+        import llama
         self.logger = logging.getLogger(__name__)
-        self.gpt = self.build_model(gpt_config) ##### TODO: import llama cpp module
-        self.model_dim = self.gpt.config.hidden_size 
-
+        self.gpt = llama.TTSLlama()
+        self.gpt.init([0], './chattts-llama_bf16_1dev_512.bmodel')
         self.num_vq = num_vq
-        self.emb_text = nn.Embedding(num_text_tokens, self.model_dim)
-        self.emb_code = nn.ModuleList([nn.Embedding(num_audio_tokens, self.model_dim) for i in range(self.num_vq)])
-        self.head_text = weight_norm(nn.Linear(self.model_dim, num_text_tokens, bias=False), name='weight')
-        self.head_code = nn.ModuleList([weight_norm(nn.Linear(self.model_dim, num_audio_tokens, bias=False), name='weight') for i in range(self.num_vq)])
+        self.gpt.max_new_tokens = 512
+        self.gpt.SEQLEN = 512
+        self.gpt.top_p = 0.7
+        # self.gpt.top_k = 20
+        self.gpt.DEBUGGING = True
+        self.gpt.temperature = 0.7
+        self.gpt.repeat_penalty = 1.0
 
-    def build_model(self, config):
-        
-        configuration = LlamaConfig(**config)
-        model = LlamaModel(configuration)
-        print('model size: {:.3f}M'.format(sum([p.numel() for p in model.parameters()]) / 1e6))
-        print(model.config)
-        print(model)
-        del model.embed_tokens
-        
-        return model
-
-
-    def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
-    ):
-        if past_key_values:
-            input_ids = input_ids[:, -1:]
-        position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -1].unsqueeze(-1)
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
-            }
-        )
-        return model_inputs
-      
     def generate_code(
         self,
         inputs_ids,
@@ -83,14 +43,24 @@ class GPT_warpper(nn.Module):
         temperature, 
         eos_token, 
         attention_mask = None,
-        max_new_token = 2048, 
+        max_new_token = 500, 
         min_new_token = 0,
         LogitsWarpers = [],
         LogitsProcessors = [],
         return_hidden=True,
     ):
-        
-        with torch.no_grad():   
+        # spk_idx就是inputs_ids中值为21143的下标; 若不存在则为-1
+        temp = torch.where(inputs_ids[0] == 21143)
+        if temp[0].shape[0] == 0:
+            spk_idx = -1
+            spk_emb = list(range(768)) # NOT USED
+        else:
+            spk_idx = temp[0].item()
+            # spk_emb转成fp16，cpp按照原样接收内存值（格式是uint16）
+            spk_emb = list(spk_emb.to(dtype=torch.float16))
+
+        with torch.no_grad():  
+ 
             hiddens = []
             
             start_idx, end_idx = inputs_ids.shape[1], torch.zeros(inputs_ids.shape[0], device=inputs_ids.device, dtype=torch.long)
@@ -99,37 +69,18 @@ class GPT_warpper(nn.Module):
             temperature = temperature[None].expand(inputs_ids.shape[0], -1)
             temperature = rearrange(temperature, "b n -> (b n) 1")
 
-            attention_mask_cache = torch.ones((inputs_ids.shape[0], inputs_ids.shape[1]+max_new_token,), dtype=torch.bool, device=inputs_ids.device)
-            if attention_mask is not None:
-                attention_mask_cache[:, :attention_mask.shape[1]] = attention_mask
-            
+            curr_input_id = None
             for i in tqdm(range(max_new_token)):
-                model_input = self.prepare_inputs_for_generation(inputs_ids, 
-                    outputs.past_key_values if i!=0 else None, 
-                    attention_mask_cache[:, :inputs_ids.shape[1]], use_cache=True)
-            
                 if i == 0:
-                    emb = self.emb_text(model_input['input_ids'][:, :, 0])
-                    if spk_emb is not None:
-                        emb[inputs_ids[:, -1] == 21143] = spk_emb.to(emb.device)
-                    model_input['inputs_embeds'] = emb
-                    breakpoint()
+                    logits, hidden = self.gpt.forward_first_code_core(inputs_ids[0].tolist(), spk_idx, spk_emb)
+                    inputs_ids = inputs_ids.unsqueeze(2).expand(-1, -1, 4)
+                    # breakpoint()
                 else:
-                    code_emb = [self.emb_code[i](model_input['input_ids'][:,:,i]) for i in range(self.num_vq)]
-                    model_input['inputs_embeds'] = torch.stack(code_emb, 3).sum(3)
+                    logits, hidden = self.gpt.forward_next_code_core(curr_input_id)
+                    # breakpoint()
                 
-                model_input['input_ids'] = None
-
-                outputs = self.gpt.forward(**model_input, output_attentions=False)
-
-                hidden_states = outputs[0] # 🐻 [1, 57, 768]
-                hiddens.append(hidden_states[:, -1])
-
-                logits = torch.stack([self.head_code[i](hidden_states) for i in range(self.num_vq)], 3) #torch.Size([1, 18, 626, 4])
-                
-                logits = logits[:, -1].float()
-
-                logits = rearrange(logits, "b c n -> (b n) c") # 1 626 4 ， 4 626
+                hiddens.append(torch.tensor(hidden, dtype=torch.float32))
+                logits = torch.tensor(logits).reshape(626, 4).transpose(0, 1)
                 logits_token = rearrange(inputs_ids[:, start_idx:], "b c n -> (b n) c") # [1, 1, 4] [4,1]
 
                 logits = logits / temperature
@@ -148,12 +99,11 @@ class GPT_warpper(nn.Module):
                 idx_next = torch.multinomial(scores, num_samples=1) # 每一行代表一个分布
                 
                 idx_next = rearrange(idx_next, "(b n) 1 -> b n", n=self.num_vq)
-                print(idx_next)
                 finish = finish | (idx_next == eos_token).any(1)
                 inputs_ids = torch.cat([inputs_ids, idx_next.unsqueeze(1)], 1)
-
+                curr_input_id = inputs_ids[0, -1].int().tolist()
                 end_idx = end_idx + (~finish).int()
-            
+                print(curr_input_id)
                 if finish.all():
                     break
             

@@ -36,11 +36,17 @@ public:
 
   int forward_first_text(std::vector<int> &tokens);
   int forward_next_text();
+  // std::vector<float> forward_first_text_core(std::vector<int> &tokens);
+  // std::vector<float> forward_next_text_core(int newtoken);
   std::vector<int> generate_text(std::vector<int> &history_tokens, int EOS, float tempreature);
 
   std::pair<std::vector<int>, std::vector<uint16_t>> forward_first_code(std::vector<int> &tokens, int idx_spk, std::vector<uint16_t> spk_emb);
   std::pair<std::vector<int>, std::vector<uint16_t>> forward_next_code();
   py::dict generate_code(std::vector<int> &history_tokens, int spk_idx, std::vector<uint16_t> &spk_emb, int EOS, float tempreture);
+
+  std::pair<std::vector<float>, std::vector<float>> forward_first_code_core(std::vector<int> &tokens, int idx_spk, std::vector<uint16_t> spk_emb);
+  std::pair<std::vector<float>, std::vector<float>> forward_next_code_core(std::vector<int> &newtoken);
+  
 
   std::mt19937 sgen;
   TTSLlama() : sgen(std::random_device()()){};
@@ -69,6 +75,7 @@ public:
   int SEQLEN;      // read from bmodel
   int NUM_LAYERS;  // read from bmodel
   int NUM_VQ;     // read from bmodel
+  int AUDIO_CODE_SIZE; // read from bmodel
   bool io_alone;
   std::vector<int> visited_text_tokens;
   std::vector<std::vector<int>> visited_code_tokens;
@@ -96,6 +103,33 @@ private:
   std::vector<bm_device_mem_t> past_key;
   std::vector<bm_device_mem_t> past_value;
 };
+
+float TTSLlama::half2float(uint16_t x) // fp16 -> fp32
+{
+    unsigned sign = ((x >> 15) & 1);
+    unsigned exponent = ((x >> 10) & 0x1f);
+    unsigned mantissa = ((x & 0x3ff) << 13);
+    if (exponent == 0x1f) {  /* NaN or Inf */
+        mantissa = (mantissa ? (sign = 0, 0x7fffff) : 0);
+        exponent = 0xff;
+    } else if (!exponent) {  /* Denorm or Zero */
+        if (mantissa) {
+            unsigned int msb;
+            exponent = 0x71;
+            do {
+                msb = (mantissa & 0x400000);
+                mantissa <<= 1;  /* normalize */
+                --exponent;
+            } while (!msb);
+            mantissa &= 0x7fffff;  /* 1.mantissa is implicit */
+        }
+    } else {
+        exponent += 0x70;
+    }
+    int temp = ((sign << 31) | (exponent << 23) | mantissa);
+ 
+    return *((float*)((void*)&temp));
+}
 
 void TTSLlama::net_launch(const bm_net_info_t *net, int stage_idx)
 {
@@ -125,35 +159,6 @@ void TTSLlama::d2d(bm_device_mem_t &dst, bm_device_mem_t &src)
 {
   bm_memcpy_d2d_byte(bm_handle, dst, 0, src, 0, bm_mem_get_device_size(src));
 }
-
-
-float TTSLlama::half2float(uint16_t x)
-{
-    unsigned sign = ((x >> 15) & 1);
-    unsigned exponent = ((x >> 10) & 0x1f);
-    unsigned mantissa = ((x & 0x3ff) << 13);
-    if (exponent == 0x1f) {  /* NaN or Inf */
-        mantissa = (mantissa ? (sign = 0, 0x7fffff) : 0);
-        exponent = 0xff;
-    } else if (!exponent) {  /* Denorm or Zero */
-        if (mantissa) {
-            unsigned int msb;
-            exponent = 0x71;
-            do {
-                msb = (mantissa & 0x400000);
-                mantissa <<= 1;  /* normalize */
-                --exponent;
-            } while (!msb);
-            mantissa &= 0x7fffff;  /* 1.mantissa is implicit */
-        }
-    } else {
-        exponent += 0x70;
-    }
-    int temp = ((sign << 31) | (exponent << 23) | mantissa);
- 
-    return *((float*)((void*)&temp));
-}
-
 
 void TTSLlama::init(const std::vector<int> &devices, std::string model_path)
 {
@@ -209,7 +214,8 @@ void TTSLlama::init(const std::vector<int> &devices, std::string model_path)
   printf("num_nets: %d\n", num_nets);
   NUM_LAYERS = 20; // (num_nets - 10) / 2;
   hidden_size = net_embed_text->stages[0].output_shapes[0].dims[2];
-  NUM_VQ = net_penalty_sample_head_code->stages[0].output_shapes[0].dims[0];
+  NUM_VQ = net_lm_code->stages[0].output_shapes[0].dims[2];
+  AUDIO_CODE_SIZE = net_lm_code->stages[0].output_shapes[0].dims[1];
   printf("NUM_LAYERS: %d, hidden_size: %d, NUM_VQ: %d\n", NUM_LAYERS, hidden_size, NUM_VQ);
 
   // resize
@@ -781,7 +787,7 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_next_code()
   // embedding
   auto &in_mem = net_embed_code_cache->stages[0].input_mems[0];
   auto &out_mem = net_embed_code_cache->stages[0].output_mems[0];
-  bm_memcpy_s2d(bm_handle, in_mem, (void *)&cur_token);
+  bm_memcpy_s2d(bm_handle, in_mem, (void *)cur_token.data());
   net_launch(net_embed_code_cache);
 
   // blocks
@@ -878,7 +884,7 @@ py::dict TTSLlama::generate_code(std::vector<int> &history_tokens, int idx_spk, 
   printf("temperature: %f\n", temperature);
   new_code_token_length = 0;
   std::vector<std::vector<int>> result_tokens;
-  std::vector<std::vector<uint16_t>> result_hiddens;
+  std::vector<std::vector<float>> result_hiddens;
   std::pair<std::vector<int>, std::vector<uint16_t>> curr_res = forward_first_code(history_tokens, idx_spk, spk_emb);
   std::vector<int> token = curr_res.first;
 
@@ -892,17 +898,24 @@ py::dict TTSLlama::generate_code(std::vector<int> &history_tokens, int idx_spk, 
   while (!has_EOS && code_token_length < SEQLEN)
   {
     result_tokens.emplace_back(token);
-    result_hiddens.emplace_back(curr_res.second);
-    new_code_token_length += 1;
+    // curr_res.second from uint16_t to float
+    std::vector<float> curr_hiddens;
+    curr_hiddens.resize(hidden_size);
+    for(int i = 0; i < int(curr_res.second.size()); i++){
+      curr_hiddens[i] = half2float(curr_res.second[i]);
+    }
     // debug
     if(DEBUGGING) {
       printf("\n================code_token_length = %d", code_token_length);
-      for(int i = 0; i < int(curr_res.second.size()); i++){
+      for(int i = 0; i < hidden_size; i++){
         if(i%5==0){printf("\n");}
-        printf("%.04f ", half2float(curr_res.second[i]));
+        printf("%.04f ", curr_hiddens[i]);
       }
       printf("\n");
     }
+    result_hiddens.emplace_back(std::move(curr_hiddens));
+    new_code_token_length += 1;
+
     curr_res = forward_next_code();
     token = curr_res.first;
     for(int i = 0; i < int(token.size()); i++){
@@ -914,6 +927,267 @@ py::dict TTSLlama::generate_code(std::vector<int> &history_tokens, int idx_spk, 
   }
   result["tokens"] = result_tokens;
   result["hiddens"] = result_hiddens;
+  return result;
+}
+
+std::pair<std::vector<float>, std::vector<float>> TTSLlama::forward_first_code_core(std::vector<int> &tokens, int idx_spk, std::vector<uint16_t> spk_emb)
+{
+  printf("forward_first_code\n");
+  std::vector<int> position_id(SEQLEN, 0);
+  std::vector<uint16_t> attention_mask(SEQLEN * SEQLEN, ATTENTION_MASK);
+  
+  for(int i = 0; i < int(tokens.size()); i++) 
+  {
+    std::fill(visited_code_tokens[i].begin(), visited_code_tokens[i].end(), tokens[i]);
+  }
+
+  code_token_length = tokens.size();
+
+  for (int i = 0; i < code_token_length; i++)
+  {
+    position_id[i] = i;
+  }
+  for (int i = 0; i < code_token_length; i++)
+  {
+    for (int j = 0; j < SEQLEN; j++)
+    {
+      if (j <= i)
+      {
+        attention_mask[i * SEQLEN + j] = 0;
+      }
+    }
+  }
+
+  // forward embeding
+  // i == 0, use text_emb
+  tokens.resize(SEQLEN, 0);
+  auto &in_mem = net_embed_text->stages[0].input_mems[0]; 
+  auto &out_mem = net_embed_text->stages[0].output_mems[0];
+  bm_memcpy_s2d(bm_handle, in_mem, (void *)tokens.data()); // i == 0##########
+  printf("token_length: %d\n", code_token_length);
+  net_launch(net_embed_text); // prefil embedding
+
+  if(DEBUGGING) {
+    std::vector<uint16_t> tmp_emb(SEQLEN*hidden_size, 0); // debug
+    bm_memcpy_d2s(bm_handle, tmp_emb.data(), out_mem); // debug
+    // debug
+    for(int t = 0; t < code_token_length; t++) {
+      for (int i = 0; i < hidden_size; i++)
+      {
+        if(i%5 == 0) printf("\n");
+        printf("%.04f ", half2float(tmp_emb[t*hidden_size + i]));
+      }
+      printf("================== \n");
+    }
+  }
+  
+  // the embedding of empty_spk --> spk_emb
+  if (idx_spk != -1)
+  {
+    int byte_size = out_mem.size / hidden_size;
+    bm_memcpy_s2d_partial_offset(bm_handle, out_mem, (void *)spk_emb.data(), hidden_size * byte_size, idx_spk * hidden_size * byte_size); // bytesize, offset
+  }
+
+  // forward blocks
+  for (int idx = 0; idx < NUM_LAYERS; idx++)
+  {
+    auto &in0_mem = net_blocks[idx]->stages[0].input_mems[0];
+    auto &in1_mem = net_blocks[idx]->stages[0].input_mems[1];
+    auto &in2_mem = net_blocks[idx]->stages[0].input_mems[2];
+    d2d(in0_mem, out_mem);
+    if (idx == 0)
+    {
+      // only first time need copy
+      bm_memcpy_s2d(bm_handle, in1_mem, (void *)position_id.data());
+      bm_memcpy_s2d(bm_handle, in2_mem, (void *)attention_mask.data());
+    }
+    net_launch(net_blocks[idx]);
+    out_mem = net_blocks[idx]->stages[0].output_mems[0]; // hiddens
+    
+    d2d(past_key[idx], net_blocks[idx]->stages[0].output_mems[1]);
+    d2d(past_value[idx], net_blocks[idx]->stages[0].output_mems[2]);
+
+    // debug
+    if(DEBUGGING) {
+      std::vector<uint16_t> temp(hidden_size*SEQLEN, 0);
+      bm_memcpy_d2s(bm_handle, temp.data(), out_mem);
+      printf("\nforward first code layer %d\n", idx);
+      for (int i = 0; i < hidden_size; i++)
+      {
+        if(i%5 == 0) printf("\n");
+        printf("%.04f ", half2float(temp[(code_token_length-1)*hidden_size + i]));
+      }
+    }
+  }
+  // (bm_handle, past_value[idx], token_offset, out2_mem, 0, bytes);
+  // forward lmhead
+  int bytes = out_mem.size / SEQLEN;
+  auto &lm_in_mem = net_lm_code->stages[0].input_mems[0];
+  auto &lm_out_mem = net_lm_code->stages[0].output_mems[0];
+  bm_memcpy_d2d_byte(bm_handle, lm_in_mem, 0, out_mem,
+                     (code_token_length - 1) * bytes, bytes);
+
+  if(DEBUGGING) { 
+    printf("\nBefore lmhead\n"); // bug here
+    std::vector<uint16_t> temp0(hidden_size, 0);
+    bm_memcpy_d2s(bm_handle, temp0.data(), lm_in_mem);
+    for (int i = 0; i < int(temp0.size()); i++)
+    {
+      if(i%5 == 0) printf("\n");
+      printf("%.04f ", half2float(temp0[i]));
+    }
+  }
+
+  net_launch(net_lm_code); // B
+
+  // debug
+  if(DEBUGGING) { 
+    std::vector<float> temp(626*4, 0);
+    bm_memcpy_d2s(bm_handle, temp.data(), lm_out_mem);
+    printf("\nAfter lmhead\n");
+    for (int i = 0; i < int(temp.size()); i++)
+    {
+      if (i % 626 == 0) printf(" ====================== ");
+      if(i%5 == 0) printf("\n");
+      printf("%.04f ", temp[i]);
+    }
+  }
+
+  std::vector<uint16_t> last_hidden(hidden_size, 0);
+  bm_memcpy_d2s_partial_offset(bm_handle, (void *)last_hidden.data(), out_mem, bytes, (code_token_length - 1) * bytes); // ##### 1*512*12*64*[2B]
+  if(DEBUGGING) {
+    printf("\nlast hidden\n"); 
+    for (int i = 0; i < int(last_hidden.size()); i++) 
+    { printf("%.04f ", half2float(last_hidden[i])); }
+    printf("\n");
+  }
+
+  std::vector<float> last_hidden_float(hidden_size, 0);
+  for (int i = 0; i < int(last_hidden.size()); i++)
+  {
+    last_hidden_float[i] = half2float(last_hidden[i]);
+  }
+
+  std::pair<std::vector<float>, std::vector<float>> result;
+
+  std::vector<float> temp(NUM_VQ*AUDIO_CODE_SIZE, 0); //1x626x4xf32
+  bm_memcpy_d2s(bm_handle, temp.data(), lm_out_mem);
+  printf("\nAfter lmhead\n");
+  for (int i = 0; i < int(temp.size()); i++)
+  {
+    if (i % 626 == 0) printf(" ====================== ");
+    if(i%5 == 0) printf("\n");
+    printf("%.04f ", temp[i]);
+  }
+
+  result.first = std::move(temp);
+  result.second = std::move(last_hidden_float);
+  return result;
+}
+
+std::pair<std::vector<float>, std::vector<float>> TTSLlama::forward_next_code_core(std::vector<int> &newtoken)
+{
+  visited_code_tokens[code_token_length] = newtoken;
+  code_token_length += 1;
+  std::vector<int> cur_token = visited_code_tokens[code_token_length - 1];
+
+  std::vector<uint16_t> attention_mask(SEQLEN + 1, 0);
+  for (int i = code_token_length - 1; i < SEQLEN; i++)
+  {
+    attention_mask[i] = ATTENTION_MASK;
+  }
+  int32_t position_id = code_token_length - 1;
+
+  // embedding
+  auto &in_mem = net_embed_code_cache->stages[0].input_mems[0];
+  auto &out_mem = net_embed_code_cache->stages[0].output_mems[0];
+  bm_memcpy_s2d(bm_handle, in_mem, (void *)cur_token.data());
+  net_launch(net_embed_code_cache);
+
+  if (DEBUGGING) {
+    std::vector<int> tmp(4);
+    bm_memcpy_d2s(bm_handle, tmp.data(), in_mem);
+    printf("\nnet_embed_code_cache in\n");
+    for (int i = 0; i < 4; i++)
+    {
+      printf("%d  ", tmp[i]);
+    }
+    std::vector<uint16_t> emb_out(hidden_size);
+    bm_memcpy_d2s(bm_handle, emb_out.data(), out_mem);
+    printf("\nnet_embed_code_cache out\n");
+    for (int i = 0; i < hidden_size; i++)
+    {
+      if(i%5 == 0) printf("\n");
+      printf("%.04f ", half2float(emb_out[i]));
+    }
+  }
+  // blocks
+  int bytes =
+      bm_mem_get_device_size(net_blocks_cache[0]->stages[0].output_mems[1]);
+  int token_offset = (code_token_length - 1) * bytes;
+  for (int idx = 0; idx < NUM_LAYERS; idx++)
+  {
+    auto &in0_mem = net_blocks_cache[idx]->stages[0].input_mems[0];
+    auto &in1_mem = net_blocks_cache[idx]->stages[0].input_mems[1];
+    auto &in2_mem = net_blocks_cache[idx]->stages[0].input_mems[2];
+    auto &in3_mem = net_blocks_cache[idx]->stages[0].input_mems[3];
+    auto &in4_mem = net_blocks_cache[idx]->stages[0].input_mems[4];
+    auto &out0_mem = net_blocks_cache[idx]->stages[0].output_mems[0];
+    auto &out1_mem = net_blocks_cache[idx]->stages[0].output_mems[1];
+    auto &out2_mem = net_blocks_cache[idx]->stages[0].output_mems[2];
+    d2d(in0_mem, out_mem);
+    if (io_alone)
+    {
+      if (idx == 0)
+      {
+        bm_memcpy_s2d(bm_handle, in1_mem, (void *)&position_id);
+        bm_memcpy_s2d(bm_handle, in2_mem, (void *)attention_mask.data());
+      }
+      else
+      {
+        d2d(in1_mem, net_blocks_cache[0]->stages[0].input_mems[1]);
+        d2d(in2_mem, net_blocks_cache[0]->stages[0].input_mems[2]);
+      }
+    }
+    else
+    {
+      if (idx == 0)
+      {
+        bm_memcpy_s2d(bm_handle, in1_mem, (void *)&position_id);
+        bm_memcpy_s2d(bm_handle, in2_mem, (void *)attention_mask.data());
+      }
+      d2d(in3_mem, past_key[idx]);
+      d2d(in4_mem, past_value[idx]);
+    }
+    net_launch(net_blocks_cache[idx]);
+    out_mem = out0_mem;
+    bm_memcpy_d2d_byte(bm_handle, past_key[idx], token_offset, out1_mem, 0,
+                       bytes);
+    bm_memcpy_d2d_byte(bm_handle, past_value[idx], token_offset, out2_mem, 0,
+                       bytes);
+  }
+
+  std::vector<uint16_t> last_hidden(hidden_size, 0);  // debug
+  bm_memcpy_d2s(bm_handle, (void *)last_hidden.data(), out_mem);
+
+  std::vector<float> last_hidden_float(hidden_size, 0); //1x626x4xf32
+  for (int i = 0; i < int(last_hidden.size()); i++)
+  {
+    last_hidden_float[i] = half2float(last_hidden[i]);
+  }
+
+  // forward lmhead
+  auto &lm_in_mem = net_lm_code->stages[0].input_mems[0];
+  auto &lm_out_mem = net_lm_code->stages[0].output_mems[0];
+  d2d(lm_in_mem, out_mem);
+  net_launch(net_lm_code);
+
+  std::vector<float> temp(NUM_VQ*AUDIO_CODE_SIZE, 0); //1x626x4xf32
+  bm_memcpy_d2s(bm_handle, temp.data(), lm_out_mem);
+
+  std::pair<std::vector<float>, std::vector<float>> result;
+  result.first = std::move(temp);
+  result.second = std::move(last_hidden_float);
   return result;
 }
 
@@ -929,6 +1203,8 @@ PYBIND11_MODULE(llama, m)
       .def("forward_first_code", &TTSLlama::forward_first_code)
       .def("forward_next_code", &TTSLlama::forward_next_code)
       .def("generate_code", &TTSLlama::generate_code)
+      .def("forward_first_code_core", &TTSLlama::forward_first_code_core)
+      .def("forward_next_code_core", &TTSLlama::forward_next_code_core)
       .def_readwrite("generation_mode_text", &TTSLlama::generation_mode_text)
       .def_readwrite("generation_mode_code", &TTSLlama::generation_mode_code)
       .def_readwrite("SEQLEN", &TTSLlama::SEQLEN) // read SEQLEN in pipeline.py
