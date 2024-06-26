@@ -7,8 +7,8 @@ from einops import rearrange
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.parametrizations import weight_norm
 import sys
+
 module_path = "./ChatTTS/model"
 if module_path not in sys.path:
     sys.path.append(module_path)
@@ -16,17 +16,15 @@ if module_path not in sys.path:
 class GPT_warpper(nn.Module):
     def __init__(
         self, 
-        gpt_config, 
-        num_audio_tokens,
-        num_text_tokens,
+        gpt_bmodel_path,
         num_vq=4,
-        **kwargs,
+        devid=0
         ):
         super().__init__()
         import llama
         self.logger = logging.getLogger(__name__)
         self.gpt = llama.TTSLlama()
-        self.gpt.init([0], './chattts-llama_bf16_1dev_512.bmodel')
+        self.gpt.init([devid], gpt_bmodel_path)
         self.num_vq = num_vq
         self.gpt.max_new_tokens = 512
         self.gpt.SEQLEN = 512
@@ -79,7 +77,7 @@ class GPT_warpper(nn.Module):
                     logits, hidden = self.gpt.forward_next_code_core(curr_input_id)
                     # breakpoint()
                 
-                hiddens.append(torch.tensor(hidden, dtype=torch.float32))
+                hiddens.append(torch.tensor(hidden, dtype=torch.float32).unsqueeze(0))
                 logits = torch.tensor(logits).reshape(626, 4).transpose(0, 1)
                 logits_token = rearrange(inputs_ids[:, start_idx:], "b c n -> (b n) c") # [1, 1, 4] [4,1]
 
@@ -108,7 +106,7 @@ class GPT_warpper(nn.Module):
                     break
             
             inputs_ids = [inputs_ids[idx, start_idx: start_idx+i] for idx, i in enumerate(end_idx.int())]
-            
+            breakpoint()
             hiddens = torch.stack(hiddens, 1)
             hiddens = [hiddens[idx, :i] for idx, i in enumerate(end_idx.int())]
                     

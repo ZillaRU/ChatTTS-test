@@ -3,16 +3,12 @@ import os
 import logging
 from functools import partial
 from omegaconf import OmegaConf
-
+from npuengine import EngineOV
 import torch
-from vocos import Vocos
+from .model.gpt_tpu_tmp import GPT_warpper
 from .model.dvae import DVAE
-
-from .utils.gpu_utils import select_device
+from .model.vocos_spectral_ops import ISTFT
 from .utils.infer_utils import count_invalid_characters, detect_language, apply_character_map, apply_half2full_map
-from .utils.io_utils import get_latest_modified_file
-
-from huggingface_hub import snapshot_download
 
 logging.basicConfig(level = logging.INFO)
 
@@ -23,6 +19,7 @@ class Chat:
         self.pretrain_models = {}
         self.normalizer = {}
         self.logger = logging.getLogger(__name__)
+        self.postprocess = ISTFT(n_fft=1024, hop_length=256, win_length=1024, padding='center')
 
     def check_model(self, level = logging.INFO, use_decoder = False):
         not_finish = False
@@ -43,52 +40,24 @@ class Chat:
             
         return not not_finish
         
-    def load_models(self, source='huggingface', force_redownload=False, local_path='<LOCAL_PATH>', **kwargs):
-        if source == 'huggingface':
-            hf_home = os.getenv('HF_HOME', os.path.expanduser("~/.cache/huggingface"))
-            try:
-                download_path = get_latest_modified_file(os.path.join(hf_home, 'hub/models--2Noise--ChatTTS/snapshots'))
-            except:
-                download_path = None
-            if download_path is None or force_redownload: 
-                self.logger.log(logging.INFO, f'Download from HF: https://huggingface.co/2Noise/ChatTTS')
-                download_path = snapshot_download(repo_id="2Noise/ChatTTS", allow_patterns=["*.pt", "*.yaml"])
-            else:
-                self.logger.log(logging.INFO, f'Load from cache: {download_path}')
-        elif source == 'local':
-            self.logger.log(logging.INFO, f'Load from local: {local_path}')
-            download_path = local_path
-
-        self._load(**{k: os.path.join(download_path, v) for k, v in OmegaConf.load(os.path.join(download_path, 'config', 'path.yaml')).items()}, **kwargs)
+    def load_models(self, local_path='<LOCAL_PATH>'):
+        self._load(**{k: os.path.join(local_path, v) for k, v in OmegaConf.load(os.path.join(local_path, 'config', 'path.yaml')).items()})
         
     def _load(
         self, 
-        vocos_config_path: str = None, 
         vocos_ckpt_path: str = None,
-        dvae_config_path: str = None,
-        dvae_ckpt_path: str = None,
-        gpt_config_path: str = None,
         gpt_ckpt_path: str = None,
-        decoder_config_path: str = None,
         decoder_ckpt_path: str = None,
         tokenizer_path: str = None,
-        device: str = None,
-        compile: bool = True,
+        dvae_config_path: str = None,
+        dvae_ckpt_path: str = None,
+        tpu_id: int = 0
     ):
-        if self.device == 'cpu':
-            from .model.gpt import GPT_warpper
-        else: 
-            # from .model.gpt_tpu import GPT_warpper
-            from .model.gpt_tpu_tmp import GPT_warpper
-        
-        if not device:
-            device = select_device(4096)
-            self.logger.log(logging.INFO, f'use {device}')
+
+        device = torch.device('cpu')
             
-        if vocos_config_path:
-            vocos = Vocos.from_hparams(vocos_config_path).to(device).eval()
-            assert vocos_ckpt_path, 'vocos_ckpt_path should not be None'
-            vocos.load_state_dict(torch.load(vocos_ckpt_path))
+        if vocos_ckpt_path:
+            vocos = EngineOV(vocos_ckpt_path, device_id=tpu_id)
             self.pretrain_models['vocos'] = vocos
             self.logger.log(logging.INFO, 'vocos loaded.')
         
@@ -100,31 +69,22 @@ class Chat:
             self.pretrain_models['dvae'] = dvae
             self.logger.log(logging.INFO, 'dvae loaded.')
             
-        if gpt_config_path:
-            cfg = OmegaConf.load(gpt_config_path)
-            gpt = GPT_warpper(**cfg).to(device).eval()
-            assert gpt_ckpt_path, 'gpt_ckpt_path should not be None'
-            gpt.load_state_dict(torch.load(gpt_ckpt_path, map_location='cpu'), strict=False)
-            if compile and 'cuda' in str(device):
-                breakpoint()
-                gpt.gpt.forward = torch.compile(gpt.gpt.forward,  backend='inductor', dynamic=True)
+        if gpt_ckpt_path:
+            gpt = GPT_warpper(gpt_bmodel_path=gpt_ckpt_path)
             self.pretrain_models['gpt'] = gpt
+
             spk_stat_path = os.path.join(os.path.dirname(gpt_ckpt_path), 'spk_stat.pt')
             assert os.path.exists(spk_stat_path), f'Missing spk_stat.pt: {spk_stat_path}'
             self.pretrain_models['spk_stat'] = torch.load(spk_stat_path).to(device)
             self.logger.log(logging.INFO, 'gpt loaded.')
             
-        if decoder_config_path:
-            cfg = OmegaConf.load(decoder_config_path)
-            decoder = DVAE(**cfg).to(device).eval()
-            assert decoder_ckpt_path, 'decoder_ckpt_path should not be None'
-            decoder.load_state_dict(torch.load(decoder_ckpt_path, map_location='cpu'))
+        if decoder_ckpt_path:
+            decoder = EngineOV(decoder_ckpt_path, device_id=tpu_id)
             self.pretrain_models['decoder'] = decoder
             self.logger.log(logging.INFO, 'decoder loaded.')
         
         if tokenizer_path:
             tokenizer = torch.load(tokenizer_path, map_location='cpu')
-            print(tokenizer)
             tokenizer.padding_side = 'left'
             self.pretrain_models['tokenizer'] = tokenizer
             self.logger.log(logging.INFO, 'tokenizer loaded.')
@@ -178,16 +138,42 @@ class Chat:
         params_infer_code.pop('prompt', '')
         result = infer_code(self.pretrain_models, text, **params_infer_code, return_hidden=use_decoder)
         
-        if use_decoder: # true
-            print('decoder input', [i[None].permute(0,2,1).shape for i in result['hiddens']])
-            mel_spec = [self.pretrain_models['decoder'](i[None].permute(0,2,1)) for i in result['hiddens']]
+        if use_decoder:
+            breakpoint()
+            mel_spec = []
+            for i in result['hiddens']:
+                i = i[None].permute(0,2,1)
+                if(i.shape[-1] < 1024):
+                    _pad = torch.zeros((i.shape[0], i.shape[1], 1024 - i.shape[-1]))
+                    i = torch.cat([i, _pad], dim=2)
+                elif i.shape[-1] > 1024:
+                    i = i[:,:, :1024]
+                    self.logger.warning('the dec mel_spec is larger than 1024')
+                breakpoint()
+                mel_spec.append(torch.from_numpy(self.pretrain_models['decoder']([i.numpy()])[0])) # out 1, 100, 2048
         else:
-            print('dvae input', [i[None].permute(0,2,1).shape for i in result['ids']])
-            mel_spec = [self.pretrain_models['dvae'](i[None].permute(0,2,1)) for i in result['ids']]
+            mel_spec = [self.pretrain_models['dvae'](i[None].permute(0, 2, 1)) for i in result['ids']]
         print('decoder out permute / vocos input', [i.shape for i in mel_spec])
-        wav = [self.pretrain_models['vocos'].decode(i).cpu().numpy() for i in mel_spec] # vocos 去除了转置卷积，直接由傅立叶逆变换，完成上采样 速度相比hifigan提升一个数量级，且效果更好
-        breakpoint()
-        return wav  # [1,250624] #/256
+        wavs = []
+        for i in mel_spec:
+            # i padding from [1, 100, x] to [1,100,2048]
+            ori_len = i.shape[-1]
+            if i.shape[-1] < 2048:
+                _pad = torch.zeros((i.shape[0], i.shape[1], 2048 - i.shape[-1]))
+                i = torch.cat([i, _pad], dim=2).numpy()
+            elif i.shape[-1] > 2048:
+                i = i[:,:, :2048].numpy()
+                self.logger.warning('the mel_spec is larger than 2048')
+            mag, x, y = self.pretrain_models['vocos']([i])
+            mag = torch.from_numpy(mag)
+            x = torch.from_numpy(x)
+            y = torch.from_numpy(y)
+            S = mag * (x + 1j * y)
+            audio = self.postprocess(S)
+            if ori_len > 2048: 
+                audio = audio[:, :(ori_len/2048*audio.shape[1]).int()]
+            wavs.append(audio.numpy())
+        return wavs  # [1,250624] #/256
     
     def sample_random_speaker(self, ):
         
