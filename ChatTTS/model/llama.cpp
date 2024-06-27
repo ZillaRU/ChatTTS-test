@@ -389,7 +389,7 @@ int TTSLlama::penalty_sample_text(const bm_net_info_t *net, bm_device_mem_t &log
 
   // repeat_penalty + top_p + top_k + temperature
   std::vector<int> generated_tokens(SEQLEN, visited_text_tokens[text_token_length - 1]); // #####
-  int repeat_last_n = std::min(repeat_last_n, text_token_length); //################
+  repeat_last_n = std::min(repeat_last_n, text_token_length); //################
   std::copy(visited_text_tokens.begin() + text_token_length - repeat_last_n,
             visited_text_tokens.begin() + text_token_length,
             generated_tokens.begin());
