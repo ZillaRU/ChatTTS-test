@@ -141,8 +141,10 @@ class Chat:
         if use_decoder:
             breakpoint()
             mel_spec = []
+            _cut = []
             for i in result['hiddens']:
                 i = i[None].permute(0,2,1)
+                _cut.append(i.shape[-1])
                 if(i.shape[-1] < 1024):
                     _pad = torch.zeros((i.shape[0], i.shape[1], 1024 - i.shape[-1]))
                     i = torch.cat([i, _pad], dim=2)
@@ -155,7 +157,7 @@ class Chat:
             mel_spec = [self.pretrain_models['dvae'](i[None].permute(0, 2, 1)) for i in result['ids']]
         print('decoder out permute / vocos input', [i.shape for i in mel_spec])
         wavs = []
-        for i in mel_spec:
+        for idx, i in enumerate(mel_spec):
             # i padding from [1, 100, x] to [1,100,2048]
             ori_len = i.shape[-1]
             if i.shape[-1] < 2048:
@@ -164,20 +166,23 @@ class Chat:
             elif i.shape[-1] > 2048:
                 i = i[:,:, :2048].numpy()
                 self.logger.warning('the mel_spec is larger than 2048')
+            else:
+                i = i.numpy()
             mag, x, y = self.pretrain_models['vocos']([i])
             mag = torch.from_numpy(mag)
             x = torch.from_numpy(x)
             y = torch.from_numpy(y)
             S = mag * (x + 1j * y)
             audio = self.postprocess(S)
-            if ori_len > 2048: 
-                audio = audio[:, :(ori_len/2048*audio.shape[1]).int()]
+            if _cut[idx] < 1024: 
+                audio = audio[:, :int(_cut[idx]/1024*audio.shape[1])]
             wavs.append(audio.numpy())
+        breakpoint()
         return wavs  # [1,250624] #/256
     
-    def sample_random_speaker(self, ):
-        
-        dim = self.pretrain_models['gpt'].gpt.layers[0].mlp.gate_proj.in_features
+    def sample_random_speaker(self, seed):
+        torch.manual_seed(seed)
+        dim = 768
         std, mean = self.pretrain_models['spk_stat'].chunk(2)
         return torch.randn(dim, device=std.device) * std + mean
     

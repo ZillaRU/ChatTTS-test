@@ -29,6 +29,7 @@ class GPT_warpper(nn.Module):
         self.gpt.max_new_tokens = 512
         self.gpt.SEQLEN = 512
         self.gpt.top_p = 0.7
+        self.gpt.repeat_last_n = 32
         # self.gpt.top_k = 20
         self.gpt.DEBUGGING = True
         self.gpt.temperature = 0.7
@@ -51,11 +52,12 @@ class GPT_warpper(nn.Module):
         temp = torch.where(inputs_ids[0] == 21143)
         if temp[0].shape[0] == 0:
             spk_idx = -1
-            spk_emb = list(range(768)) # NOT USED
+            spk_emb = list(range(768))
+            self.logger.info("Not set speaker")
         else:
             spk_idx = temp[0].item()
             # spk_emb转成fp16，cpp按照原样接收内存值（格式是uint16）
-            spk_emb = list(spk_emb.to(dtype=torch.float16))
+            spk_emb = spk_emb[0].tolist()
 
         with torch.no_grad():  
  
@@ -72,10 +74,8 @@ class GPT_warpper(nn.Module):
                 if i == 0:
                     logits, hidden = self.gpt.forward_first_code_core(inputs_ids[0].tolist(), spk_idx, spk_emb)
                     inputs_ids = inputs_ids.unsqueeze(2).expand(-1, -1, 4)
-                    # breakpoint()
                 else:
                     logits, hidden = self.gpt.forward_next_code_core(curr_input_id)
-                    # breakpoint()
                 
                 hiddens.append(torch.tensor(hidden, dtype=torch.float32).unsqueeze(0))
                 logits = torch.tensor(logits).reshape(626, 4).transpose(0, 1)
@@ -124,77 +124,17 @@ class GPT_warpper(nn.Module):
         temperature, 
         eos_token, 
         attention_mask = None,
-        max_new_token = 2048, 
+        max_new_token = 500, 
         min_new_token = 0,
         LogitsWarpers = [],
         LogitsProcessors = [],
         return_hidden=False,
     ):
-        
-        with torch.no_grad():
-
-            start_idx, end_idx = inputs_ids.shape[1], torch.zeros(inputs_ids.shape[0], device=inputs_ids.device, dtype=torch.long)
-            finish = torch.zeros(inputs_ids.shape[0], device=inputs_ids.device).bool()
-            
-            temperature = temperature[None].expand(inputs_ids.shape[0], -1)
-            temperature = rearrange(temperature, "b n -> (b n) 1")
-            print(temperature.shape, temperature)
-
-            attention_mask_cache = torch.ones((inputs_ids.shape[0], inputs_ids.shape[1]+max_new_token,), dtype=torch.bool, device=inputs_ids.device)
-
-            if attention_mask is not None:
-                attention_mask_cache[:, :attention_mask.shape[1]] = attention_mask
-            
-            for i in tqdm(range(max_new_token)):
-                model_input = self.prepare_inputs_for_generation(inputs_ids, 
-                    outputs.past_key_values if i!=0 else None, 
-                    attention_mask_cache[:, :inputs_ids.shape[1]], use_cache=True)
-            
-                if i == 0: 
-                    model_input['inputs_embeds'] = self.emb_text(inputs_ids[:, :, 0])
-                else:
-                    model_input['inputs_embeds'] = self.emb_text(inputs_ids[:, :, 0][:,-1:]) # self.emb_text(inputs_ids[:, :, 0][-1:])
-                
-                model_input['input_ids'] = None
-                # ['input_ids' None, 'position_ids' torch.Size([1, 1]), 'past_key_values' 20 2 torch.Size([1, 1, 12, 64], 'use_cache', 'attention_mask' torch.Size([1, 59]), 'inputs_embeds'] # torch.Size([1, 1, 768]))
-                
-                outputs = self.gpt.forward(**model_input, output_attentions=False) # return_attn = false odict_keys(['last_hidden_state', 'past_key_values'])
-                
-                hidden_states = outputs[0] # 🐻 [1, 57, 768]
-
-                logits = self.head_text(hidden_states)
-                logits = logits[:, -1].float()
-
-                logits_token = inputs_ids[:, start_idx:, 0]
-                    
-                logits = logits / temperature
-                
-                for logitsProcessors in LogitsProcessors:
-                    logits = logitsProcessors(logits_token, logits)
-                    
-                for logitsWarpers in LogitsWarpers:
-                    logits = logitsWarpers(logits_token, logits)
-                    
-                if i < min_new_token:
-                    logits[:, eos_token] = -torch.inf
-                
-                scores = F.softmax(logits, dim=-1)
-            
-                idx_next = torch.multinomial(scores, num_samples=1)
-                print(idx_next.shape, idx_next)
-                finish = finish | (idx_next == eos_token).any(1)
-                inputs_ids = torch.cat([inputs_ids, idx_next.unsqueeze(-1).expand(-1, -1, self.num_vq)], 1)
-                # breakpoint()
-
-                end_idx = end_idx + (~finish).int()
-            
-                if finish.all():
-                    break
-            
-            inputs_ids = [inputs_ids[idx, start_idx: start_idx+i] for idx, i in enumerate(end_idx.int())]
-            inputs_ids = [i[:, 0] for i in inputs_ids]
-            breakpoint()
-            if not finish.all():
-                self.logger.warn(f'Incomplete result. hit max_new_token: {max_new_token}')    
-            
-            return inputs_ids
+        inputs_ids_list = inputs_ids[0].tolist()
+        self.gpt.temperature = temperature
+        self.gpt.repeat_penalty = 1.0
+        inputs_ids = self.gpt.generate_text(inputs_ids_list, eos_token, temperature)
+        inputs_ids = torch.tensor(inputs_ids, dtype=torch.int64).unsqueeze(0).unsqueeze(0)
+        print(inputs_ids.shape)
+        breakpoint()
+        return inputs_ids

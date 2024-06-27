@@ -40,13 +40,17 @@ public:
   // std::vector<float> forward_next_text_core(int newtoken);
   std::vector<int> generate_text(std::vector<int> &history_tokens, int EOS, float tempreature);
 
-  std::pair<std::vector<int>, std::vector<uint16_t>> forward_first_code(std::vector<int> &tokens, int idx_spk, std::vector<uint16_t> spk_emb);
+  std::pair<std::vector<int>, std::vector<uint16_t>> forward_first_code(std::vector<int> &tokens, int idx_spk, std::vector<float> spk_emb);
   std::pair<std::vector<int>, std::vector<uint16_t>> forward_next_code();
-  py::dict generate_code(std::vector<int> &history_tokens, int spk_idx, std::vector<uint16_t> &spk_emb, int EOS, float tempreture);
+  py::dict generate_code(std::vector<int> &history_tokens, int spk_idx, std::vector<float> &spk_emb, int EOS, float tempreture);
 
-  std::pair<std::vector<float>, std::vector<float>> forward_first_code_core(std::vector<int> &tokens, int idx_spk, std::vector<uint16_t> spk_emb);
+  std::pair<std::vector<float>, std::vector<float>> forward_first_code_core(std::vector<int> &tokens, int idx_spk, std::vector<float> spk_emb);
   std::pair<std::vector<float>, std::vector<float>> forward_next_code_core(std::vector<int> &newtoken);
-  
+  union Fp32
+  {
+    uint32_t u;
+    float f;
+  };
 
   std::mt19937 sgen;
   TTSLlama() : sgen(std::random_device()()){};
@@ -63,8 +67,9 @@ private:
   int penalty_sample_text(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
   std::vector<int> penalty_sample_code(const bm_net_info_t *net, bm_device_mem_t &logits_mem);
 
-  // 内联函数用于将uint16_t的半精度浮点数转换为float的单精度浮点数
-  inline float half2float(uint16_t h);
+  // data type conversion
+  inline float half2float(uint16_t value);
+  inline uint16_t float2uint16(float value);
 
 public:
   int text_token_length;
@@ -82,6 +87,7 @@ public:
   bool DEBUGGING = true;
 
   // generation
+  int repeat_last_n;
   float temperature;
   float top_p;
   float repeat_penalty;
@@ -104,32 +110,90 @@ private:
   std::vector<bm_device_mem_t> past_value;
 };
 
-float TTSLlama::half2float(uint16_t x) // fp16 -> fp32
+// ref: https://blog.csdn.net/qq_39016531/article/details/107411030
+uint16_t TTSLlama::float2uint16(float value)
 {
-    unsigned sign = ((x >> 15) & 1);
-    unsigned exponent = ((x >> 10) & 0x1f);
-    unsigned mantissa = ((x & 0x3ff) << 13);
-    if (exponent == 0x1f) {  /* NaN or Inf */
-        mantissa = (mantissa ? (sign = 0, 0x7fffff) : 0);
-        exponent = 0xff;
-    } else if (!exponent) {  /* Denorm or Zero */
-        if (mantissa) {
-            unsigned int msb;
-            exponent = 0x71;
-            do {
-                msb = (mantissa & 0x400000);
-                mantissa <<= 1;  /* normalize */
-                --exponent;
-            } while (!msb);
-            mantissa &= 0x7fffff;  /* 1.mantissa is implicit */
-        }
-    } else {
-        exponent += 0x70;
+
+    const Fp32 f32infty = { 255U << 23 };
+    const Fp32 f16infty = { 31U << 23 };
+    const Fp32 magic = { 15U << 23 };
+    const uint32_t sign_mask = 0x80000000U;
+    const uint32_t round_mask = ~0xFFFU;
+
+    Fp32 in;
+    uint16_t out;
+
+    in.f = value;
+
+    uint32_t sign = in.u & sign_mask;
+    in.u ^= sign;
+
+    if (in.u >= f32infty.u) /* Inf or NaN (all exponent bits set) */
+    {
+        /* NaN->sNaN and Inf->Inf */
+        out = (in.u > f32infty.u) ? 0x7FFFU : 0x7C00U;
     }
-    int temp = ((sign << 31) | (exponent << 23) | mantissa);
- 
-    return *((float*)((void*)&temp));
+    else /* (De)normalized number or zero */
+    {
+        in.u &= round_mask;
+        in.f *= magic.f;
+        in.u -= round_mask;
+        if (in.u > f16infty.u)
+        {
+            in.u = f16infty.u; /* Clamp to signed infinity if overflowed */
+        }
+
+        out = uint16_t(in.u >> 13); /* Take the bits! */
+    }
+
+    out = uint16_t(out | (sign >> 16));
+
+    return out;
 }
+
+float TTSLlama::half2float(uint16_t value)
+{
+    const Fp32 magic = { (254U - 15U) << 23 };
+    const Fp32 was_infnan = { (127U + 16U) << 23 };
+    Fp32 out;
+
+    out.u = (value & 0x7FFFU) << 13;   /* exponent/mantissa bits */
+    out.f *= magic.f;                  /* exponent adjust */
+    if (out.f >= was_infnan.f)         /* make sure Inf/NaN survive */
+    {
+        out.u |= 255U << 23;
+    }
+    out.u |= (value & 0x8000U) << 16;  /* sign bit */
+
+    return out.f;
+}
+
+// float TTSLlama::half2float(uint16_t x) // fp16 -> fp32
+// {
+//     unsigned sign = ((x >> 15) & 1);
+//     unsigned exponent = ((x >> 10) & 0x1f);
+//     unsigned mantissa = ((x & 0x3ff) << 13);
+//     if (exponent == 0x1f) {  /* NaN or Inf */
+//         mantissa = (mantissa ? (sign = 0, 0x7fffff) : 0);
+//         exponent = 0xff;
+//     } else if (!exponent) {  /* Denorm or Zero */
+//         if (mantissa) {
+//             unsigned int msb;
+//             exponent = 0x71;
+//             do {
+//                 msb = (mantissa & 0x400000);
+//                 mantissa <<= 1;  /* normalize */
+//                 --exponent;
+//             } while (!msb);
+//             mantissa &= 0x7fffff;  /* 1.mantissa is implicit */
+//         }
+//     } else {
+//         exponent += 0x70;
+//     }
+//     int temp = ((sign << 31) | (exponent << 23) | mantissa);
+ 
+//     return *((float*)((void*)&temp));
+// }
 
 void TTSLlama::net_launch(const bm_net_info_t *net, int stage_idx)
 {
@@ -623,7 +687,7 @@ std::vector<int> TTSLlama::penalty_sample_code(const bm_net_info_t *net, bm_devi
   return curr_token;
 }
 
-std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_first_code(std::vector<int> &tokens, int idx_spk, std::vector<uint16_t> spk_emb)
+std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_first_code(std::vector<int> &tokens, int idx_spk, std::vector<float> spk_emb)
 {
   printf("forward_first_code\n");
   std::vector<int> position_id(SEQLEN, 0);
@@ -677,8 +741,13 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_first_code(
   // the embedding of empty_spk --> spk_emb
   if (idx_spk != -1)
   {
+    std::vector<uint16_t> tmp(hidden_size, 0);
+    for(int i = 0; i < hidden_size; i++)
+    {
+      tmp[i] = float2uint16(spk_emb[i]);
+    }
     int byte_size = out_mem.size / hidden_size;
-    bm_memcpy_s2d_partial_offset(bm_handle, out_mem, (void *)spk_emb.data(), hidden_size * byte_size, idx_spk * hidden_size * byte_size); // bytesize, offset
+    bm_memcpy_s2d_partial_offset(bm_handle, out_mem, (void *)tmp.data(), hidden_size * byte_size, idx_spk * hidden_size * byte_size); // bytesize, offset
   }
 
   // forward blocks
@@ -861,7 +930,7 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_next_code()
   return result;
 }
 
-py::dict TTSLlama::generate_code(std::vector<int> &history_tokens, int idx_spk, std::vector<uint16_t> &spk_emb, int EOS, float temp_tempreature)
+py::dict TTSLlama::generate_code(std::vector<int> &history_tokens, int idx_spk, std::vector<float> &spk_emb, int EOS, float temp_tempreature)
 {
   printf("generate code\n");
   py::dict result;
@@ -930,7 +999,7 @@ py::dict TTSLlama::generate_code(std::vector<int> &history_tokens, int idx_spk, 
   return result;
 }
 
-std::pair<std::vector<float>, std::vector<float>> TTSLlama::forward_first_code_core(std::vector<int> &tokens, int idx_spk, std::vector<uint16_t> spk_emb)
+std::pair<std::vector<float>, std::vector<float>> TTSLlama::forward_first_code_core(std::vector<int> &tokens, int idx_spk, std::vector<float> spk_emb)
 {
   printf("forward_first_code\n");
   std::vector<int> position_id(SEQLEN, 0);
@@ -984,8 +1053,13 @@ std::pair<std::vector<float>, std::vector<float>> TTSLlama::forward_first_code_c
   // the embedding of empty_spk --> spk_emb
   if (idx_spk != -1)
   {
+    std::vector<uint16_t> tmp(hidden_size, 0);
+    for(int i = 0; i < hidden_size; i++)
+    {
+      tmp[i] = float2uint16(spk_emb[i]);
+    }
     int byte_size = out_mem.size / hidden_size;
-    bm_memcpy_s2d_partial_offset(bm_handle, out_mem, (void *)spk_emb.data(), hidden_size * byte_size, idx_spk * hidden_size * byte_size); // bytesize, offset
+    bm_memcpy_s2d_partial_offset(bm_handle, out_mem, (void *)tmp.data(), hidden_size * byte_size, idx_spk * hidden_size * byte_size); // bytesize, offset
   }
 
   // forward blocks
@@ -1211,6 +1285,7 @@ PYBIND11_MODULE(llama, m)
       .def_readwrite("temperature", &TTSLlama::temperature)
       .def_readwrite("top_p", &TTSLlama::top_p)
       .def_readwrite("repeat_penalty", &TTSLlama::repeat_penalty)
+      .def_readwrite("repeat_last_n", &TTSLlama::repeat_last_n)
       .def_readwrite("max_new_tokens", &TTSLlama::max_new_tokens)
       .def_readwrite("DEBUGGING", &TTSLlama::DEBUGGING);
 }
