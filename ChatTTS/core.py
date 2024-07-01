@@ -14,7 +14,7 @@ logging.basicConfig(level = logging.INFO)
 
 
 class Chat:
-    def __init__(self, device = 'cpu'):
+    def __init__(self, device = 'tpu'):
         self.device = device
         self.pretrain_models = {}
         self.normalizer = {}
@@ -99,7 +99,7 @@ class Chat:
         params_refine_text={}, 
         params_infer_code={'prompt':'[speed_5]'}, 
         use_decoder=True,
-        do_text_normalization=True,
+        do_text_normalization=False, # caution: SoC install pynini failed
         lang=None,
     ):
         if self.device == 'cpu':
@@ -139,7 +139,7 @@ class Chat:
         result = infer_code(self.pretrain_models, text, **params_infer_code, return_hidden=use_decoder)
         
         if use_decoder:
-            breakpoint()
+            # breakpoint()
             mel_spec = []
             _cut = []
             for i in result['hiddens']:
@@ -151,7 +151,7 @@ class Chat:
                 elif i.shape[-1] > 1024:
                     i = i[:,:, :1024]
                     self.logger.warning('the dec mel_spec is larger than 1024')
-                breakpoint()
+                # breakpoint()
                 mel_spec.append(torch.from_numpy(self.pretrain_models['decoder']([i.numpy()])[0])) # out 1, 100, 2048
         else:
             mel_spec = [self.pretrain_models['dvae'](i[None].permute(0, 2, 1)) for i in result['ids']]
@@ -177,10 +177,9 @@ class Chat:
             if _cut[idx] < 1024: 
                 audio = audio[:, :int(_cut[idx]/1024*audio.shape[1])]
             wavs.append(audio.numpy())
-        breakpoint()
         return wavs  # [1,250624] #/256
     
-    def sample_random_speaker(self, seed):
+    def sample_random_speaker(self, seed=0):
         torch.manual_seed(seed)
         dim = 768
         std, mean = self.pretrain_models['spk_stat'].chunk(2)

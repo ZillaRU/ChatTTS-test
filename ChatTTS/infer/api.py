@@ -16,7 +16,7 @@ def infer_code(
     **kwargs
 ):
     
-    device = next(models['vocos'].parameters()).device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     if not isinstance(text, list): 
         text = [text]
@@ -81,7 +81,7 @@ def refine_text(
     **kwargs
 ):
     
-    device = next(models['vocos'].parameters()).device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     if not isinstance(text, list): 
         text = [text]

@@ -98,10 +98,10 @@ def main():
 
     print("loading ChatTTS model...")
     global chat
-    chat = ChatTTS.Chat()
+    chat = ChatTTS.Chat(device='tpu')
 
     if args.local_path == None:
-        chat.load_models()
+        chat.load_models(local_path='./model_files')
     else:
         print('local model path:', args.local_path)
         chat.load_models('local', local_path=args.local_path)

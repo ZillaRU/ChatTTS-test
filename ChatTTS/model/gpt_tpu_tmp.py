@@ -25,7 +25,7 @@ class GPT_warpper(nn.Module):
         import llama
         self.logger = logging.getLogger(__name__)
         self.gpt = llama.TTSLlama()
-        self.gpt.init([devid], 'chattts-llama_int8_1dev_512.bmodel') # gpt_bmodel_path)
+        self.gpt.init([devid], gpt_bmodel_path)
         self.num_vq = num_vq
         self.gpt.max_new_tokens = 512
         self.gpt.SEQLEN = 512
@@ -49,30 +49,30 @@ class GPT_warpper(nn.Module):
         LogitsProcessors = [],
         return_hidden=True,
     ):
-        self.gpt.DEBUGGING = True
-        self.gpt.temperature = temperature[0].item()
-        self.gpt.repeat_penalty = 1.05
-        # spk_idx就是inputs_ids中值为21143的下标; 若不存在则为-1
-        temp = torch.where(inputs_ids[0] == 21143)
-        if temp[0].shape[0] == 0:
-            spk_idx = -1
-            spk_emb = list(range(768))
-            self.logger.info("Not set speaker")
-        else:
-            spk_idx = temp[0].item()
-            # spk_emb转成fp16，cpp按照原样接收内存值（格式是uint16）
-            spk_emb = spk_emb[0].tolist()
+        # self.gpt.DEBUGGING = True
+        # self.gpt.temperature = temperature[0].item()
+        # self.gpt.repeat_penalty = 1.05
+        # # spk_idx就是inputs_ids中值为21143的下标; 若不存在则为-1
+        # temp = torch.where(inputs_ids[0] == 21143)
+        # if temp[0].shape[0] == 0:
+        #     spk_idx = -1
+        #     spk_emb = list(range(768))
+        #     self.logger.info("Not set speaker")
+        # else:
+        #     spk_idx = temp[0].item()
+        #     # spk_emb转成fp16，cpp按照原样接收内存值（格式是uint16）
+        #     spk_emb = spk_emb[0].tolist()
 
-        inputs_ids_list = inputs_ids[0].tolist()
-        breakpoint()
-        res = self.gpt.generate_code(inputs_ids_list, spk_idx, spk_emb, eos_token, temperature[0].item())
-        print(res['tokens'])
-        res['ids'] = torch.tensor(res['tokens'], dtype=torch.int64).unsqueeze(0)
-        print(res['ids'].shape)
-        hiddens_np = np.array(res['hiddens'], dtype=np.float32)
-        # cpp中实际是从device mem拷贝的fp16数值（但vector定义中写的是uint16），这里直接按fp16读取
-        res['hiddens'] = torch.from_numpy(hiddens_np).unsqueeze(0)
-        return res
+        # inputs_ids_list = inputs_ids[0].tolist()
+        # breakpoint()
+        # res = self.gpt.generate_code(inputs_ids_list, spk_idx, spk_emb, eos_token, temperature[0].item())
+        # print(res['tokens'])
+        # res['ids'] = torch.tensor(res['tokens'], dtype=torch.int64).unsqueeze(0)
+        # print(res['ids'].shape)
+        # hiddens_np = np.array(res['hiddens'], dtype=np.float32)
+        # # cpp中实际是从device mem拷贝的fp16数值（但vector定义中写的是uint16），这里直接按fp16读取
+        # res['hiddens'] = torch.from_numpy(hiddens_np).unsqueeze(0)
+        # return res
     
         # spk_idx就是inputs_ids中值为21143的下标; 若不存在则为-1
         temp = torch.where(inputs_ids[0] == 21143)
@@ -127,7 +127,7 @@ class GPT_warpper(nn.Module):
                 inputs_ids = torch.cat([inputs_ids, idx_next.unsqueeze(1)], 1)
                 curr_input_id = inputs_ids[0, -1].int().tolist()
                 end_idx = end_idx + (~finish).int()
-                print(curr_input_id)
+                # print(curr_input_id)
                 if finish.all():
                     break
             
@@ -155,10 +155,12 @@ class GPT_warpper(nn.Module):
         return_hidden=False,
     ):
         inputs_ids_list = inputs_ids[0].tolist()
+        if isinstance(eos_token, torch.Tensor):
+            eos_token = eos_token.item()
+        if isinstance(temperature, torch.Tensor):
+            temperature = temperature.item()
         self.gpt.temperature = temperature
         self.gpt.repeat_penalty = 1.0
         inputs_ids = self.gpt.generate_text(inputs_ids_list, eos_token, temperature)
         inputs_ids = torch.tensor(inputs_ids, dtype=torch.int64).unsqueeze(0).unsqueeze(0)
-        print(inputs_ids.shape)
-        breakpoint()
         return inputs_ids
