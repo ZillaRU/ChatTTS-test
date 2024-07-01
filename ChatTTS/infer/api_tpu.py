@@ -12,7 +12,7 @@ def infer_code(
     top_K = 20, 
     temperature = 0.3, 
     repetition_penalty = 1.05,
-    max_new_token = 2048,
+    max_new_token = 400,
     **kwargs
 ):
     

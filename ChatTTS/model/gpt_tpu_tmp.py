@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import sys
+import numpy as np
 
 module_path = "./ChatTTS/model"
 if module_path not in sys.path:
@@ -24,14 +25,14 @@ class GPT_warpper(nn.Module):
         import llama
         self.logger = logging.getLogger(__name__)
         self.gpt = llama.TTSLlama()
-        self.gpt.init([devid], gpt_bmodel_path)
+        self.gpt.init([devid], 'chattts-llama_int8_1dev_512.bmodel') # gpt_bmodel_path)
         self.num_vq = num_vq
         self.gpt.max_new_tokens = 512
         self.gpt.SEQLEN = 512
         self.gpt.top_p = 0.7
-        self.gpt.repeat_last_n = 32
+        self.gpt.repeat_last_n = 512
         # self.gpt.top_k = 20
-        self.gpt.DEBUGGING = True
+        self.gpt.DEBUGGING = False
         self.gpt.temperature = 0.7
         self.gpt.repeat_penalty = 1.0
 
@@ -42,12 +43,37 @@ class GPT_warpper(nn.Module):
         temperature, 
         eos_token, 
         attention_mask = None,
-        max_new_token = 500, 
+        max_new_token = 400, 
         min_new_token = 0,
         LogitsWarpers = [],
         LogitsProcessors = [],
         return_hidden=True,
     ):
+        self.gpt.DEBUGGING = True
+        self.gpt.temperature = temperature[0].item()
+        self.gpt.repeat_penalty = 1.05
+        # spk_idx就是inputs_ids中值为21143的下标; 若不存在则为-1
+        temp = torch.where(inputs_ids[0] == 21143)
+        if temp[0].shape[0] == 0:
+            spk_idx = -1
+            spk_emb = list(range(768))
+            self.logger.info("Not set speaker")
+        else:
+            spk_idx = temp[0].item()
+            # spk_emb转成fp16，cpp按照原样接收内存值（格式是uint16）
+            spk_emb = spk_emb[0].tolist()
+
+        inputs_ids_list = inputs_ids[0].tolist()
+        breakpoint()
+        res = self.gpt.generate_code(inputs_ids_list, spk_idx, spk_emb, eos_token, temperature[0].item())
+        print(res['tokens'])
+        res['ids'] = torch.tensor(res['tokens'], dtype=torch.int64).unsqueeze(0)
+        print(res['ids'].shape)
+        hiddens_np = np.array(res['hiddens'], dtype=np.float32)
+        # cpp中实际是从device mem拷贝的fp16数值（但vector定义中写的是uint16），这里直接按fp16读取
+        res['hiddens'] = torch.from_numpy(hiddens_np).unsqueeze(0)
+        return res
+    
         # spk_idx就是inputs_ids中值为21143的下标; 若不存在则为-1
         temp = torch.where(inputs_ids[0] == 21143)
         if temp[0].shape[0] == 0:
@@ -106,13 +132,11 @@ class GPT_warpper(nn.Module):
                     break
             
             inputs_ids = [inputs_ids[idx, start_idx: start_idx+i] for idx, i in enumerate(end_idx.int())]
-            breakpoint()
             hiddens = torch.stack(hiddens, 1)
             hiddens = [hiddens[idx, :i] for idx, i in enumerate(end_idx.int())]
                     
             if not finish.all():
                 self.logger.warn(f'Incomplete result. hit max_new_token: {max_new_token}')    
-            breakpoint()
             return {
                 'ids': inputs_ids, # [505,4]
                 'hiddens':hiddens, #[505, 768]

@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -g -shared  -o llama.cpython-310-x86_64-linux-gnu.so CMakeFiles/llama.dir/llama.cpp.o   -L/workspace/ChatTTS-TPU/ChatTTS/model/../../LLM-TPU/support/lib_pcie  -Wl,-rpath,/workspace/ChatTTS-TPU/ChatTTS/model/../../LLM-TPU/support/lib_pcie: -lbmrt -lbmlib 

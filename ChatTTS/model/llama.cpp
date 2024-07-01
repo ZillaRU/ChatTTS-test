@@ -93,7 +93,7 @@ public:
   float repeat_penalty;
   int max_new_tokens;
   std::string generation_mode_text = "penalty_sample";
-  std::string generation_mode_code = "hidden_states";
+  std::string generation_mode_code = "penalty_sample";
 
 private:
   std::vector<bm_handle_t> handles;
@@ -267,7 +267,7 @@ void TTSLlama::init(const std::vector<int> &devices, std::string model_path)
   net_lm_code = bmrt_get_network_info(p_bmrt, "lm_head_code");
 
   net_penalty_sample_head_text = bmrt_get_network_info(p_bmrt, "penalty_sample_head_text");
-  net_penalty_sample_head_code = bmrt_get_network_info(p_bmrt, "chattts_sample_head_code");
+  net_penalty_sample_head_code = bmrt_get_network_info(p_bmrt, "penalty_sample_head_code");
 
   net_greedy_head_text = bmrt_get_network_info(p_bmrt, "greedy_head_text");
   net_greedy_head_code = bmrt_get_network_info(p_bmrt, "greedy_head_code");
@@ -629,60 +629,72 @@ std::vector<int> TTSLlama::greedy_search_code(const bm_net_info_t *net, bm_devic
 
 std::vector<int> TTSLlama::penalty_sample_code(const bm_net_info_t *net, bm_device_mem_t &logits_mem)
 {
-  auto &in1_mem = net->stages[0].input_mems[1]; // 0m_logits, 1input_ids, valid_token_len, penalty, temperature
+  auto &in1_mem = net->stages[0].input_mems[1];
   auto &in2_mem = net->stages[0].input_mems[2];
   auto &in3_mem = net->stages[0].input_mems[3];
   auto &in4_mem = net->stages[0].input_mems[4];
   auto &out0_mem = net->stages[0].output_mems[0];
+  auto &out1_mem = net->stages[0].output_mems[1];
 
   // repeat_penalty + top_p + top_k + temperature
-  std::vector<int> generated_tokens(16 * NUM_VQ, 0); // ##### visited_tokens[token_length - 1]
+  std::vector<int> generated_tokens(SEQLEN * NUM_VQ, 625); // ##### visited_tokens[token_length - 1]
 
-  for(int i = 0; i < 16; i++)
+  // for(int i = 0; i < SEQLEN; i++)
+  // {
+  //   for(int j = 0; j < NUM_VQ; j++)
+  //   {
+  //     generated_tokens[i * NUM_VQ + j] = visited_code_tokens[code_token_length - 1][j];
+  //   }
+  // }
+  
+  // if(DEBUGGING) 
+  // {
+  //   printf("generated_tokens = \n");
+  //   for (int i = 0; i < int(generated_tokens.size()); ++i) 
+  //   {
+  //     if(i%5 == 0) printf("\n");
+  //     printf("%d ", generated_tokens[i]);
+  //   }
+  // }
+
+  repeat_last_n = std::min(repeat_last_n, code_token_length);
+
+  for (int i = 0; i < repeat_last_n; ++i) 
   {
-    for(int j = 0; j < NUM_VQ; j++)
+      std::copy(visited_code_tokens[code_token_length - repeat_last_n + i].begin(), visited_code_tokens[code_token_length - repeat_last_n + i].end(), generated_tokens.begin() + i * NUM_VQ);
+  }
+  if(DEBUGGING) 
+  {
+    printf("repeat_last_n = %d\n", repeat_last_n);
+    printf("generated_tokens = \n");
+    for (int i = 0; i < int(generated_tokens.size()); ++i) 
     {
-      generated_tokens[i * NUM_VQ + j] = visited_code_tokens[code_token_length - 1][j];
+      if(i%5 == 0) printf("\n");
+      printf("%d ", generated_tokens[i]);
     }
   }
-  int st_idx = code_token_length - std::min(16, new_code_token_length);
-  for (int i = st_idx; i < code_token_length; ++i) 
-  {
-      std::copy(visited_code_tokens[i].begin(), visited_code_tokens[i].end(), generated_tokens.begin() + (i-st_idx) * NUM_VQ);
-  }
-  
   bm_memcpy_s2d(bm_handle, in1_mem, (void *)generated_tokens.data());
-  bm_memcpy_s2d(bm_handle, in2_mem, (void *)&new_code_token_length);
-  bm_memcpy_s2d(bm_handle, in3_mem, (void *)&repeat_penalty);
-  bm_memcpy_s2d(bm_handle, in4_mem, (void *)&temperature);
+  bm_memcpy_s2d(bm_handle, in2_mem, (void *)&top_p);
+  bm_memcpy_s2d(bm_handle, in3_mem, (void *)&temperature);
+  bm_memcpy_s2d(bm_handle, in4_mem, (void *)&repeat_penalty);
 
   // inference
   head_launch(net, logits_mem);
 
   // get logit & token
-  int num_code = net->stages[0].output_shapes[0].dims[1];
-  std::vector<float> probs_flat(NUM_VQ * num_code);
-  // std::vector<float> tokens_flat(NUM_VQ * candidate_num); // caution: the output tokens of penalty_sample_head_code is [float] not [int]
+  int candidate_num = net->stages[0].output_shapes[0].dims[2];
+  std::vector<float> probs_flat(NUM_VQ * candidate_num);
+  std::vector<float> tokens_flat(NUM_VQ * candidate_num); // caution: the output tokens of penalty_sample_head_code is [float] not [int]
 
   bm_memcpy_d2s(bm_handle, probs_flat.data(), out0_mem);
-
-  if(DEBUGGING) 
-  {
-    std::cout << "probs_flat:" << std::endl;
-    for(int i = 0; i < int(probs_flat.size()); i++)
-    {
-      std::cout << probs_flat[i] << " ";
-      if(i % 10 == 9) std::cout << std::endl;
-    }
-    std::cout << std::endl;
-  }
+  bm_memcpy_d2s(bm_handle, tokens_flat.data(), out1_mem);
 
   std::vector<int> curr_token(NUM_VQ, 0);
   // penalty_sample
   for(int i = 0; i < NUM_VQ; i++)
   {
-    std::discrete_distribution<> dist(probs_flat.begin()+i*num_code, probs_flat.begin()+(i+1)*num_code);
-    curr_token[i] = int(dist(sgen));
+    std::discrete_distribution<> dist(probs_flat.begin()+i*candidate_num, probs_flat.begin()+(i+1)*candidate_num);
+    curr_token[i] = int(tokens_flat[i*candidate_num + dist(sgen)]);
   }
   return curr_token;
 }
@@ -825,17 +837,16 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_first_code(
   }  
 
   std::vector<int> token;
-
+  code_token_length = 0;
   if (generation_mode_code == "greedy") {
     token = greedy_search_code(net_greedy_head_code, lm_out_mem);
   } else if (generation_mode_code == "penalty_sample") {
     token = penalty_sample_code(net_penalty_sample_head_code, lm_out_mem);
   } else {
-    token.resize(NUM_VQ, 0); // ################
+    printf("Error: unknown generation mode: %s\n", generation_mode_code.c_str());
   }
-
-  visited_code_tokens[code_token_length] = token;
-  code_token_length += 1;
+  visited_code_tokens[0] = token;
+  code_token_length = 1;
   std::pair<std::vector<int>, std::vector<uint16_t>> result;
   result.first = token;
   result.second = last_hidden;
@@ -859,6 +870,23 @@ std::pair<std::vector<int>, std::vector<uint16_t>> TTSLlama::forward_next_code()
   bm_memcpy_s2d(bm_handle, in_mem, (void *)cur_token.data());
   net_launch(net_embed_code_cache);
 
+  if (DEBUGGING) {
+    std::vector<int> tmp(4);
+    bm_memcpy_d2s(bm_handle, tmp.data(), in_mem);
+    printf("\nnet_embed_code_cache in\n");
+    for (int i = 0; i < 4; i++)
+    {
+      printf("%d  ", tmp[i]);
+    }
+    std::vector<uint16_t> emb_out(hidden_size);
+    bm_memcpy_d2s(bm_handle, emb_out.data(), out_mem);
+    printf("\nnet_embed_code_cache out\n");
+    for (int i = 0; i < hidden_size; i++)
+    {
+      if(i%5 == 0) printf("\n");
+      printf("%.04f ", half2float(emb_out[i]));
+    }
+  }
   // blocks
   int bytes =
       bm_mem_get_device_size(net_blocks_cache[0]->stages[0].output_mems[1]);
